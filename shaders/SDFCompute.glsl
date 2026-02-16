@@ -25,14 +25,18 @@ layout(std430, binding = 3) buffer EditBuffer {
     SDFEditGPU edits[];
 };
 
+layout(std430, binding = 4) buffer SelectionBuffer {
+    int hitIndex; // Written by shader if pixel matches mouse
+};
+
 layout(push_constant) uniform PushConstants {
     vec4 camPos;     // xyz + pad
     vec4 camDir;     // xyz + pad
     vec4 params;     // resX, resY, time, editCount
     uint renderMode; // 0=Lit, 1=Normals, 2=Complexity
     uint showGround; // 1=On, 0=Off
-    float pad3;
-    float pad4;
+    float mouseX;    // -1 if not picking
+    float mouseY;
 };
 
 // ============== SDF Primitives ==============
@@ -103,6 +107,7 @@ struct HitResult {
     vec3  albedo;
     float roughness;
     float metallic;
+    int   index; // -1 for sky/nothing, 0 for ground, 1+ for edits
 };
 
 HitResult mapScene(vec3 p) {
@@ -114,6 +119,7 @@ HitResult mapScene(vec3 p) {
     res.albedo = vec3(0.5);
     res.roughness = 0.8;
     res.metallic = 0.0;
+    res.index = -1;
 
     // Ground plane (optional)
     if (showGround == 1) {
@@ -125,6 +131,7 @@ HitResult mapScene(vec3 p) {
             res.albedo = mix(vec3(0.35, 0.38, 0.42), vec3(0.55, 0.58, 0.62), checker);
             res.roughness = 0.9;
             res.metallic = 0.0;
+            res.index = 0; // Ground index
         }
     }
 
@@ -142,21 +149,27 @@ HitResult mapScene(vec3 p) {
                     res.albedo = e.albedo;
                     res.roughness = e.roughness;
                     res.metallic = e.metallic;
+                    res.index = i + 1; // Edit index (1-based because 0 is ground)
                 }
                 break;
             case 1: // Subtraction
             {
                 float newDist = opSubtract(res.dist, d);
-                if (newDist < res.dist && d < 0.001) { // If we are cutting, take material if inside
-                     // Usually subtraction keeps the base material but we can blend if needed
-                }
+                // Subtraction keeps base material/index
                 res.dist = newDist;
                 break;
             }
             case 2: // Intersection
-                res.dist = opIntersect(res.dist, d);
-                // For intersection, we might want to blend based on which is closer to surface
+            {
+                float newDist = opIntersect(res.dist, d);
+                // If intersection is closer to the new part, swap index?
+                // For simplicity, we keep the previous index for now or take the new one if closer
+                if (newDist < res.dist && d < res.dist) {
+                    res.index = i + 1;
+                }
+                res.dist = newDist;
                 break;
+            }
             case 3: // Smooth Union
             {
                 float k = max(e.blendFactor, 0.01);
@@ -165,6 +178,7 @@ HitResult mapScene(vec3 p) {
                 res.albedo = mix(e.albedo, res.albedo, h);
                 res.roughness = mix(e.roughness, res.roughness, h);
                 res.metallic = mix(e.metallic, res.metallic, h);
+                if (h < 0.5) res.index = i + 1; // Take index of the "closer" or "more dominant" part
                 res.dist = newDist;
                 break;
             }
@@ -173,7 +187,6 @@ HitResult mapScene(vec3 p) {
                 float k = max(e.blendFactor, 0.01);
                 float newDist = opSmoothSub(res.dist, d, k);
                 float h = clamp(0.5 - 0.5 * (res.dist + d) / k, 0.0, 1.0);
-                // Optional: blend material into the "cut" surface
                 res.albedo = mix(res.albedo, e.albedo, h * 0.5); 
                 res.dist = newDist;
                 break;
@@ -281,6 +294,7 @@ void main() {
     float t = 0.0;
     HitResult hit;
     hit.dist = 1e10;
+    hit.index = -1;
     bool hitSurface = false;
     int steps = 0;
 
@@ -294,6 +308,11 @@ void main() {
         }
         if (t > 100.0) break;
         t += hit.dist;
+    }
+
+    // Write selection result if this pixel is the target
+    if (pixel.x == int(mouseX) && pixel.y == int(mouseY)) {
+        hitIndex = hitSurface ? hit.index : -1;
     }
 
     vec3 color = vec3(0);
@@ -321,12 +340,11 @@ void main() {
         color = mix(vec3(0.45, 0.50, 0.60), vec3(0.20, 0.30, 0.55), skyT);
     }
 
-    // Tone map + gamma (skipped for debug modes usually, but kept for consistency)
+    // Tone map + gamma
     if (renderMode == 0) {
         color = ACESFilm(color);
         color = pow(color, vec3(1.0 / 2.2));
     } else if (renderMode == 1) {
-        // Just gamma for normals
         color = pow(color, vec3(1.0 / 2.2));
     }
 

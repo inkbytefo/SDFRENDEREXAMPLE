@@ -54,6 +54,7 @@ void Window::keyCallback(GLFWwindow* win, int key, int /*scancode*/, int action,
 void Window::mouseButtonCallback(GLFWwindow* win, int button, int action, int /*mods*/) {
     auto* self = static_cast<Window*>(glfwGetWindowUserPointer(win));
     if (button >= 0 && button < 3) {
+        if (action == GLFW_PRESS) self->input.mouseClicked[button] = true;
         self->input.mouseButtons[button] = (action == GLFW_PRESS);
     }
     // Right-click toggles camera capture

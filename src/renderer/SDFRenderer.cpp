@@ -11,7 +11,8 @@ SDFRenderer::SDFRenderer(core::VulkanContext& context) : context(context) {
         { 0, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute },  // Brick Atlas
         { 1, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute },  // Sparse Map
         { 2, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute },  // Out Image
-        { 3, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute }  // Edit Buffer
+        { 3, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute }, // Edit Buffer
+        { 4, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute }  // Selection Buffer
     };
     descriptorSetLayout = descriptorManager->createLayout(bindings);
     descriptorSet = descriptorManager->allocateSet(descriptorSetLayout);
@@ -22,6 +23,18 @@ SDFRenderer::SDFRenderer(core::VulkanContext& context) : context(context) {
         vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent
     );
+
+    // Create selection buffer (single int)
+    selectionBuffer = context.getResourceManager().createBuffer(
+        sizeof(int32_t),
+        vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent
+    );
+
+    int32_t clearVal = -1;
+    void* clearPtr = context.getDevice().mapMemory(selectionBuffer.memory.get(), 0, sizeof(int32_t));
+    std::memcpy(clearPtr, &clearVal, sizeof(int32_t));
+    context.getDevice().unmapMemory(selectionBuffer.memory.get());
 
     // Push constant range
     vk::PushConstantRange pushConstantRange{};
@@ -56,6 +69,8 @@ SDFRenderer::SDFRenderer(core::VulkanContext& context) : context(context) {
     pushConstants.resY = static_cast<float>(outputHeight);
     pushConstants.time = 0.0f;
     pushConstants.editCount = 0.0f;
+    pushConstants.mouseX = -1.0f;
+    pushConstants.mouseY = -1.0f;
     pushConstants.renderMode = renderMode;
     pushConstants.showGround = showGround ? 1 : 0;
 
@@ -142,6 +157,12 @@ void SDFRenderer::update(float deltaTime, const core::InputState& input, bool im
     pushConstants.camDirZ = dirZ;
     pushConstants.editCount = static_cast<float>(edits.size());
 
+    // Reset picking if not explicitly requested this frame
+    if (!pickingRequested) {
+        pushConstants.mouseX = -1.0f;
+        pushConstants.mouseY = -1.0f;
+    }
+
     // Upload edits if changed
     if (editsDirty) {
         updateEditBuffer();
@@ -182,6 +203,23 @@ void SDFRenderer::render(vk::CommandBuffer commandBuffer) {
     uint32_t groupX = (outputWidth + 7) / 8;
     uint32_t groupY = (outputHeight + 7) / 8;
     commandBuffer.dispatch(groupX, groupY, 1);
+
+    // After dispatch, if we were picking, we need a barrier to ensure write is visible to host
+    if (pickingRequested) {
+        vk::BufferMemoryBarrier pickingBarrier{};
+        pickingBarrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+        pickingBarrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        pickingBarrier.buffer = selectionBuffer.buffer.get();
+        pickingBarrier.offset = 0;
+        pickingBarrier.size = sizeof(int32_t);
+
+        commandBuffer.pipelineBarrier(
+            vk::PipelineStageFlagBits::eComputeShader,
+            vk::PipelineStageFlagBits::eHost,
+            {}, nullptr, pickingBarrier, nullptr
+        );
+        pickingRequested = false; 
+    }
 
     barrier.oldLayout = vk::ImageLayout::eGeneral;
     barrier.newLayout = vk::ImageLayout::eTransferSrcOptimal;
@@ -228,14 +266,41 @@ void SDFRenderer::createDescriptorSets() {
     editBufInfo.offset = 0;
     editBufInfo.range = sizeof(core::SDFEdit) * 256;
 
+    vk::DescriptorBufferInfo selectBufInfo{};
+    selectBufInfo.buffer = selectionBuffer.buffer.get();
+    selectBufInfo.offset = 0;
+    selectBufInfo.range = sizeof(int32_t);
+
     std::vector<vk::WriteDescriptorSet> writes = {
         { descriptorSet, 0, 0, 1, vk::DescriptorType::eStorageImage, &atlasInfo, nullptr, nullptr },
         { descriptorSet, 1, 0, 1, vk::DescriptorType::eStorageImage, &mapInfo, nullptr, nullptr },
         { descriptorSet, 2, 0, 1, vk::DescriptorType::eStorageImage, &outInfo, nullptr, nullptr },
-        { descriptorSet, 3, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &editBufInfo, nullptr }
+        { descriptorSet, 3, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &editBufInfo, nullptr },
+        { descriptorSet, 4, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &selectBufInfo, nullptr }
     };
 
     descriptorManager->updateSet(descriptorSet, writes);
+}
+
+void SDFRenderer::triggerPicking(float x, float y) {
+    pushConstants.mouseX = x;
+    pushConstants.mouseY = y;
+    pickingRequested = true;
+}
+
+int SDFRenderer::getSelectedObjectIndex() {
+    int32_t result = -1;
+    void* data = context.getDevice().mapMemory(selectionBuffer.memory.get(), 0, sizeof(int32_t));
+    std::memcpy(&result, data, sizeof(int32_t));
+    context.getDevice().unmapMemory(selectionBuffer.memory.get());
+
+    // Reset it to -1 for next pick
+    int32_t clearVal = -1;
+    void* clearPtr = context.getDevice().mapMemory(selectionBuffer.memory.get(), 0, sizeof(int32_t));
+    std::memcpy(clearPtr, &clearVal, sizeof(int32_t));
+    context.getDevice().unmapMemory(selectionBuffer.memory.get());
+
+    return result;
 }
 
 } // namespace engine::renderer

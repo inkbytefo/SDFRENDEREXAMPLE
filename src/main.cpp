@@ -73,9 +73,18 @@ int main() {
         // 7. Main Loop
         float lastFrameTime = static_cast<float>(glfwGetTime());
         int selectedEdit = 0;
+        bool pendingPick = false;
 
         while (!window.shouldClose()) {
             window.pollEvents();
+
+            if (pendingPick) {
+                int hit = renderer.getSelectedObjectIndex();
+                if (hit > 0) { // 1+ are edits
+                    selectedEdit = hit - 1;
+                }
+                pendingPick = false;
+            }
 
             float currentTime = static_cast<float>(glfwGetTime());
             float deltaTime = currentTime - lastFrameTime;
@@ -87,6 +96,15 @@ int main() {
             // Update
             physics.update(deltaTime);
             renderer.update(deltaTime, window.getInput(), imguiCapture);
+
+            // Handle picking
+            if (window.getInput().mouseClicked[0] && !imguiCapture) {
+                renderer.triggerPicking(
+                    static_cast<float>(window.getInput().mouseX), 
+                    static_cast<float>(window.getInput().mouseY)
+                );
+                pendingPick = true;
+            }
 
             // Begin frame
             context.beginFrame();

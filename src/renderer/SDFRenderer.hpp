@@ -16,7 +16,7 @@ struct PushConstants {
     float resX, resY, time, editCount;
     uint32_t renderMode; // 0=Lit, 1=Normals, 2=Complexity
     uint32_t showGround; // 1=On, 0=Off
-    float pad3, pad4;
+    float mouseX, mouseY; // -1 if not picking
 };
 
 class SDFRenderer {
@@ -26,8 +26,10 @@ public:
 
     void update(float deltaTime, const core::InputState& input, bool imguiCapture);
     void render(vk::CommandBuffer commandBuffer);
-
     vk::Image getOutputImage() const { return outputImage.image.get(); }
+
+    void triggerPicking(float x, float y);
+    int getSelectedObjectIndex(); // -1 for sky/nothing, 0 for ground, 1+ for edits
 
     // Public access for editor
     std::vector<core::SDFEdit>& getEdits() { return edits; }
@@ -46,8 +48,10 @@ private:
     
     ResourceManager::Image outputImage;
     ResourceManager::Buffer editBuffer;
+    ResourceManager::Buffer selectionBuffer;
     std::vector<core::SDFEdit> edits;
     bool editsDirty = true;
+    bool pickingRequested = false;
 
     PushConstants pushConstants{};
     float totalTime = 0.0f;
