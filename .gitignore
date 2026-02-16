@@ -1,0 +1,27 @@
+# Build artifacts
+build/
+CMakeFiles/
+CMakeCache.txt
+*.cmake
+Makefile
+*.sln
+*.vcxproj*
+*.dir/
+
+# Temp/User files
+imgui.ini
+.vs/
+.vscode/
+
+# Binaries
+*.exe
+*.o
+*.obj
+*.spv
+*.dll
+*.lib
+*.pdb
+
+# OS files
+.DS_Store
+Thumbs.db
