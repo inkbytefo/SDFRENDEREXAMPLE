@@ -74,6 +74,7 @@ target_link_libraries(imgui_lib PUBLIC Vulkan::Vulkan glfw)
 # Shader Compilation
 set(SHADERS
     shaders/SDFCompute.glsl
+    shaders/TerrainBrush.glsl
 )
 
 foreach(SHADER ${SHADERS})
@@ -113,6 +114,7 @@ add_executable(Engine
     src/renderer/ComputePipeline.hpp
     src/renderer/SDFRenderer.cpp
     src/renderer/SDFRenderer.hpp
+    src/renderer/Terrain.cpp
     src/editor/EditorUI.cpp
     src/editor/EditorUI.hpp
     ${SPIRV_SHADERS}

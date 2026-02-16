@@ -7,6 +7,7 @@
 #include "core/InputState.hpp"
 #include <vector>
 #include <cmath>
+#include "Terrain.hpp"
 
 namespace engine::renderer {
 
@@ -17,6 +18,9 @@ struct PushConstants {
     uint32_t renderMode; // 0=Lit, 1=Normals, 2=Complexity
     uint32_t showGround; // 1=On, 0=Off
     float mouseX, mouseY; // -1 if not picking
+    float brushX, brushY, brushZ, brushRadius; // World space brush
+    uint32_t showGrid; // 1=On, 0=Off
+    float pad2, pad3;
 };
 
 class SDFRenderer {
@@ -28,8 +32,12 @@ public:
     void render(vk::CommandBuffer commandBuffer);
     vk::Image getOutputImage() const { return outputImage.image.get(); }
 
+    struct SelectionData {
+        int32_t hitIndex; // -1 none, 0 ground, 1+ edit
+        float posX, posY, posZ;
+    };
+    SelectionData getSelection();
     void triggerPicking(float x, float y);
-    int getSelectedObjectIndex(); // -1 for sky/nothing, 0 for ground, 1+ for edits
 
     // Public access for editor
     std::vector<core::SDFEdit>& getEdits() { return edits; }
@@ -37,6 +45,13 @@ public:
 
     uint32_t& getRenderMode() { return renderMode; }
     bool& getShowGround() { return showGround; }
+    
+    void setBrush(float x, float y, float z, float r) {
+        brushX = x; brushY = y; brushZ = z; brushRadius = r;
+    }
+    bool& getShowGrid() { return showGrid; }
+
+    Terrain& getTerrain() { return *terrain; }
 
 private:
     core::VulkanContext& context;
@@ -66,9 +81,14 @@ private:
     
     uint32_t renderMode = 0;
     bool showGround = true;
+    bool showGrid = false;
+    float brushX = 0, brushY = 0, brushZ = 0, brushRadius = 0;
 
     void createDescriptorSets();
     void updateEditBuffer();
+
+    std::unique_ptr<Terrain> terrain;
+    vk::Sampler terrainSampler;
 };
 
 } // namespace engine::renderer

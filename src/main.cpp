@@ -79,7 +79,7 @@ int main() {
             window.pollEvents();
 
             if (pendingPick) {
-                int hit = renderer.getSelectedObjectIndex();
+                int hit = renderer.getSelection().hitIndex;
                 if (hit > 0) { // 1+ are edits
                     selectedEdit = hit - 1;
                 }

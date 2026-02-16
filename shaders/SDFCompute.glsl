@@ -26,8 +26,12 @@ layout(std430, binding = 3) buffer EditBuffer {
 };
 
 layout(std430, binding = 4) buffer SelectionBuffer {
-    int hitIndex; // Written by shader if pixel matches mouse
+    int hitIndex;
+    float hitPosX, hitPosY, hitPosZ;
 };
+
+layout(binding = 5) uniform sampler2D terrainHeight;
+layout(binding = 6) uniform sampler2D terrainSplat;
 
 layout(push_constant) uniform PushConstants {
     vec4 camPos;     // xyz + pad
@@ -37,6 +41,11 @@ layout(push_constant) uniform PushConstants {
     uint showGround; // 1=On, 0=Off
     float mouseX;    // -1 if not picking
     float mouseY;
+    vec4 brushPos;   // xyz=pos, w=radius
+    uint showGrid;
+    float pad1;
+    float pad2;
+    float pad3;
 };
 
 // ============== SDF Primitives ==============
@@ -67,6 +76,50 @@ float sdCylinder(vec3 p, float h, float r) {
 
 float sdPlane(vec3 p) {
     return p.y;
+}
+
+float sdTerrain(vec3 p) {
+    const float worldSize = 256.0;
+    vec2 uv = (p.xz + worldSize * 0.5) / worldSize;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return p.y;
+    
+    float h = textureLod(terrainHeight, uv, 0.0).r;
+    return (p.y - h) * 0.5; // Conservative step
+}
+
+vec4 getTerrainMaterial(vec3 p) {
+    const float worldSize = 256.0;
+    vec2 uv = (p.xz + worldSize * 0.5) / worldSize;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return vec4(0.5, 0.8, 0.0, 0.0);
+
+    vec4 splat = textureLod(terrainSplat, uv, 0.0);
+    
+    // Define 4 materials
+    // Mat 0 (Red ch): Grass
+    vec3 col0 = vec3(0.1, 0.4, 0.1); float rough0 = 0.9; float met0 = 0.0;
+    // Mat 1 (Green ch): Dirt
+    vec3 col1 = vec3(0.4, 0.3, 0.2); float rough1 = 1.0; float met1 = 0.0;
+    // Mat 2 (Blue ch): Rock
+    vec3 col2 = vec3(0.5, 0.5, 0.5); float rough2 = 0.7; float met2 = 0.0;
+    // Mat 3 (Alpha ch): Snow
+    vec3 col3 = vec3(0.9, 0.9, 0.95); float rough3 = 0.3; float met3 = 0.0;
+    
+    vec3 albedo = col0 * splat.r + col1 * splat.g + col2 * splat.b + col3 * splat.a;
+    float roughness = rough0 * splat.r + rough1 * splat.g + rough2 * splat.b + rough3 * splat.a;
+    float metallic = met0 * splat.r + met1 * splat.g + met2 * splat.b + met3 * splat.a;
+    
+    // Normalize if sum > 1 (it should be roughly 1)
+    float sum = dot(splat, vec4(1.0));
+    if (sum > 0.001) {
+        albedo /= sum;
+        roughness /= sum;
+        metallic /= sum;
+    }
+    
+    return vec4(albedo, roughness); // pack roughness in A? No, wait.
+    // Return struct-like? No, vec4 is rigid. 
+    // Let's just return a packed vec4: rgb=albedo, a=roughness. Metallic separate?
+    // Metallic is mostly 0 for terrain.
 }
 
 // ============== SDF for a single edit ==============
@@ -123,14 +176,80 @@ HitResult mapScene(vec3 p) {
 
     // Ground plane (optional)
     if (showGround == 1) {
-        float ground = sdPlane(p);
+        float ground = sdTerrain(p);
         if (ground < res.dist) {
             res.dist = ground;
-            // Checkerboard
-            float checker = mod(floor(p.x * 0.5) + floor(p.z * 0.5), 2.0);
-            res.albedo = mix(vec3(0.35, 0.38, 0.42), vec3(0.55, 0.58, 0.62), checker);
-            res.roughness = 0.9;
-            res.metallic = 0.0;
+            
+            // Material from splatmap
+            const float worldSize = 256.0;
+            vec2 uv = (p.xz + worldSize * 0.5) / worldSize;
+            
+            if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
+                 vec4 splat = textureLod(terrainSplat, uv, 0.0);
+                 
+                // Mat 0 (Red ch): Grass
+                vec3 col0 = vec3(0.1, 0.4, 0.1); float rough0 = 0.9; float met0 = 0.0;
+                // Mat 1 (Green ch): Dirt
+                vec3 col1 = vec3(0.4, 0.3, 0.2); float rough1 = 1.0; float met1 = 0.0;
+                // Mat 2 (Blue ch): Rock
+                vec3 col2 = vec3(0.5, 0.5, 0.5); float rough2 = 0.7; float met2 = 0.0;
+                // Mat 3 (Alpha ch): Snow
+                vec3 col3 = vec3(0.9, 0.9, 0.95); float rough3 = 0.3; float met3 = 0.0;
+                
+                res.albedo = col0 * splat.r + col1 * splat.g + col2 * splat.b + col3 * splat.a;
+                res.roughness = rough0 * splat.r + rough1 * splat.g + rough2 * splat.b + rough3 * splat.a;
+                res.metallic = met0 * splat.r + met1 * splat.g + met2 * splat.b + met3 * splat.a;
+                
+                float sum = dot(splat, vec4(1.0));
+                if (sum > 0.001) {
+                    res.albedo /= sum;
+                    res.roughness /= sum;
+                    res.metallic /= sum;
+                }
+            } else {
+                 // Checkerboard fallback
+                float checker = mod(floor(p.x * 0.5) + floor(p.z * 0.5), 2.0);
+                res.albedo = mix(vec3(0.35, 0.38, 0.42), vec3(0.55, 0.58, 0.62), checker);
+                res.roughness = 0.9;
+                res.metallic = 0.0;
+            }
+
+            // --- Debug Grid ---
+            if (showGrid == 1) {
+                // World space grid
+                float gridSize = 1.0;
+                float lineThickness = 0.02;
+                
+                // Simple non-anti-aliased grid for now to avoid derivative issues in compute
+                vec2 g = abs(fract(p.xz / gridSize - 0.5) - 0.5);
+                float gLine = min(g.x, g.y);
+                if (gLine < lineThickness) {
+                    res.albedo = mix(res.albedo, vec3(0.8), 0.5); // Light grid
+                }
+                
+                // Major grid
+                vec2 gMajor = abs(fract(p.xz / 10.0) - 0.5);
+                float gMajorLine = min(gMajor.x, gMajor.y);
+                if (gMajorLine < 0.005) { // 0.005 * 10 = 0.05
+                    res.albedo = mix(res.albedo, vec3(1.0), 0.6); // White major lines
+                }
+            }
+
+            // --- Brush Cursor ---
+            if (brushPos.w > 0.0) {
+                 float dist = distance(p, brushPos.xyz);
+                 float ringWidth = 0.1;
+                 
+                 // Ring
+                 if (abs(dist - brushPos.w) < ringWidth) {
+                     res.albedo = mix(res.albedo, vec3(1.0, 0.5, 0.0), 0.8); // Orange ring
+                 }
+                 // Area
+                 else if (dist < brushPos.w) {
+                     res.albedo = mix(res.albedo, vec3(1.0, 0.5, 0.0), 0.1); // Faint orange fill
+                 }
+            }
+            
             res.index = 0; // Ground index
         }
     }
@@ -313,6 +432,10 @@ void main() {
     // Write selection result if this pixel is the target
     if (pixel.x == int(mouseX) && pixel.y == int(mouseY)) {
         hitIndex = hitSurface ? hit.index : -1;
+        vec3 hp = ro + rd * t;
+        hitPosX = hp.x;
+        hitPosY = hp.y;
+        hitPosZ = hp.z;
     }
 
     vec3 color = vec3(0);

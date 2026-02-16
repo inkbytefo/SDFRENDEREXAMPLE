@@ -7,12 +7,36 @@ namespace engine::renderer {
 SDFRenderer::SDFRenderer(core::VulkanContext& context) : context(context) {
     descriptorManager = std::make_unique<DescriptorManager>(context.getDevice());
 
+    terrain = std::make_unique<Terrain>(context);
+
+    // Create a linear sampler for terrain
+    vk::SamplerCreateInfo samplerInfo{};
+    samplerInfo.magFilter = vk::Filter::eLinear;
+    samplerInfo.minFilter = vk::Filter::eLinear;
+    samplerInfo.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+    samplerInfo.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+    samplerInfo.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy = 1.0f;
+    samplerInfo.borderColor = vk::BorderColor::eIntOpaqueBlack;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    samplerInfo.compareEnable = VK_FALSE;
+    samplerInfo.compareOp = vk::CompareOp::eAlways;
+    samplerInfo.mipmapMode = vk::SamplerMipmapMode::eLinear;
+    samplerInfo.mipLodBias = 0.0f;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = 0.0f;
+
+    terrainSampler = context.getDevice().createSampler(samplerInfo);
+
     std::vector<vk::DescriptorSetLayoutBinding> bindings = {
         { 0, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute },  // Brick Atlas
         { 1, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute },  // Sparse Map
         { 2, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute },  // Out Image
         { 3, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute }, // Edit Buffer
-        { 4, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute }  // Selection Buffer
+        { 4, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute }, // Selection Buffer
+        { 5, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute }, // Terrain Height
+        { 6, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute }  // Terrain Splat
     };
     descriptorSetLayout = descriptorManager->createLayout(bindings);
     descriptorSet = descriptorManager->allocateSet(descriptorSetLayout);
@@ -24,16 +48,16 @@ SDFRenderer::SDFRenderer(core::VulkanContext& context) : context(context) {
         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent
     );
 
-    // Create selection buffer (single int)
+    // Create selection buffer (hit index + vec3 pos)
     selectionBuffer = context.getResourceManager().createBuffer(
-        sizeof(int32_t),
+        sizeof(SelectionData),
         vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc,
         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent
     );
 
-    int32_t clearVal = -1;
-    void* clearPtr = context.getDevice().mapMemory(selectionBuffer.memory.get(), 0, sizeof(int32_t));
-    std::memcpy(clearPtr, &clearVal, sizeof(int32_t));
+    SelectionData clearVal{-1, 0, 0, 0};
+    void* clearPtr = context.getDevice().mapMemory(selectionBuffer.memory.get(), 0, sizeof(SelectionData));
+    std::memcpy(clearPtr, &clearVal, sizeof(SelectionData));
     context.getDevice().unmapMemory(selectionBuffer.memory.get());
 
     // Push constant range
@@ -73,17 +97,31 @@ SDFRenderer::SDFRenderer(core::VulkanContext& context) : context(context) {
     pushConstants.mouseY = -1.0f;
     pushConstants.renderMode = renderMode;
     pushConstants.showGround = showGround ? 1 : 0;
+    pushConstants.brushX = 0;
+    pushConstants.brushY = 0;
+    pushConstants.brushZ = 0;
+    pushConstants.brushRadius = 0;
+    pushConstants.showGrid = showGrid ? 1 : 0;
 
     createDescriptorSets();
 }
 
-SDFRenderer::~SDFRenderer() {}
+SDFRenderer::~SDFRenderer() {
+    if (terrainSampler) {
+        context.getDevice().destroySampler(terrainSampler);
+    }
+}
 
 void SDFRenderer::update(float deltaTime, const core::InputState& input, bool imguiCapture) {
     totalTime += deltaTime;
     pushConstants.time = totalTime;
     pushConstants.renderMode = renderMode;
     pushConstants.showGround = showGround ? 1 : 0;
+    pushConstants.showGrid = showGrid ? 1 : 0;
+    pushConstants.brushX = brushX;
+    pushConstants.brushY = brushY;
+    pushConstants.brushZ = brushZ;
+    pushConstants.brushRadius = brushRadius;
 
     // Camera control: only when right-click is held and ImGui doesn't capture
     if (input.mouseCaptured && !imguiCapture) {
@@ -171,6 +209,10 @@ void SDFRenderer::update(float deltaTime, const core::InputState& input, bool im
 }
 
 void SDFRenderer::render(vk::CommandBuffer commandBuffer) {
+    if (terrain) {
+        terrain->executePending(commandBuffer);
+    }
+
     vk::ImageMemoryBarrier barrier{};
     barrier.oldLayout = vk::ImageLayout::eUndefined;
     barrier.newLayout = vk::ImageLayout::eGeneral;
@@ -211,7 +253,7 @@ void SDFRenderer::render(vk::CommandBuffer commandBuffer) {
         pickingBarrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
         pickingBarrier.buffer = selectionBuffer.buffer.get();
         pickingBarrier.offset = 0;
-        pickingBarrier.size = sizeof(int32_t);
+        pickingBarrier.size = sizeof(SelectionData);
 
         commandBuffer.pipelineBarrier(
             vk::PipelineStageFlagBits::eComputeShader,
@@ -269,14 +311,26 @@ void SDFRenderer::createDescriptorSets() {
     vk::DescriptorBufferInfo selectBufInfo{};
     selectBufInfo.buffer = selectionBuffer.buffer.get();
     selectBufInfo.offset = 0;
-    selectBufInfo.range = sizeof(int32_t);
+    selectBufInfo.range = sizeof(SelectionData);
+
+    vk::DescriptorImageInfo diffInfo{};
+    diffInfo.imageLayout = vk::ImageLayout::eGeneral; // Using General as it's also storage
+    diffInfo.imageView = terrain->getHeightmap().view.get();
+    diffInfo.sampler = terrainSampler;
+
+    vk::DescriptorImageInfo splatInfo{};
+    splatInfo.imageLayout = vk::ImageLayout::eGeneral;
+    splatInfo.imageView = terrain->getSplatmap().view.get();
+    splatInfo.sampler = terrainSampler;
 
     std::vector<vk::WriteDescriptorSet> writes = {
         { descriptorSet, 0, 0, 1, vk::DescriptorType::eStorageImage, &atlasInfo, nullptr, nullptr },
         { descriptorSet, 1, 0, 1, vk::DescriptorType::eStorageImage, &mapInfo, nullptr, nullptr },
         { descriptorSet, 2, 0, 1, vk::DescriptorType::eStorageImage, &outInfo, nullptr, nullptr },
         { descriptorSet, 3, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &editBufInfo, nullptr },
-        { descriptorSet, 4, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &selectBufInfo, nullptr }
+        { descriptorSet, 4, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &selectBufInfo, nullptr },
+        { descriptorSet, 5, 0, 1, vk::DescriptorType::eCombinedImageSampler, &diffInfo, nullptr, nullptr },
+        { descriptorSet, 6, 0, 1, vk::DescriptorType::eCombinedImageSampler, &splatInfo, nullptr, nullptr }
     };
 
     descriptorManager->updateSet(descriptorSet, writes);
@@ -288,16 +342,16 @@ void SDFRenderer::triggerPicking(float x, float y) {
     pickingRequested = true;
 }
 
-int SDFRenderer::getSelectedObjectIndex() {
-    int32_t result = -1;
-    void* data = context.getDevice().mapMemory(selectionBuffer.memory.get(), 0, sizeof(int32_t));
-    std::memcpy(&result, data, sizeof(int32_t));
+SDFRenderer::SelectionData SDFRenderer::getSelection() {
+    SelectionData result{-1, 0, 0, 0};
+    void* data = context.getDevice().mapMemory(selectionBuffer.memory.get(), 0, sizeof(SelectionData));
+    std::memcpy(&result, data, sizeof(SelectionData));
     context.getDevice().unmapMemory(selectionBuffer.memory.get());
 
     // Reset it to -1 for next pick
-    int32_t clearVal = -1;
-    void* clearPtr = context.getDevice().mapMemory(selectionBuffer.memory.get(), 0, sizeof(int32_t));
-    std::memcpy(clearPtr, &clearVal, sizeof(int32_t));
+    SelectionData clearVal{-1, 0, 0, 0};
+    void* clearPtr = context.getDevice().mapMemory(selectionBuffer.memory.get(), 0, sizeof(SelectionData));
+    std::memcpy(clearPtr, &clearVal, sizeof(SelectionData));
     context.getDevice().unmapMemory(selectionBuffer.memory.get());
 
     return result;

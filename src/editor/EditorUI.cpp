@@ -1,6 +1,7 @@
 #include "EditorUI.hpp"
 #include "renderer/SDFRenderer.hpp"
 #include "core/SDFEdit.hpp"
+#include "renderer/Terrain.hpp"
 
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
@@ -14,6 +15,17 @@ namespace engine::editor {
 static const char* primitiveNames[] = { "Sphere", "Box", "Torus", "Capsule", "Cylinder" };
 static const char* operationNames[] = { "Union", "Subtraction", "Intersection", "SmoothUnion", "SmoothSub" };
 static const char* renderModeNames[] = { "Lit (Standard PBR)", "Normals", "Complexity (Steps)" };
+static const char* brushModeNames[] = { "Raise", "Lower", "Flatten", "Smooth", "Paint" };
+static const char* layerNames[] = { "Grass (Base)", "Dirt (R)", "Rock (G)", "Snow (B)" };
+
+// Terrain State
+static float brushRadius = 0.1f;
+static float brushStrength = 0.5f;
+static int brushMode = 0;
+static int paintLayer = 1; // Default to 'Dirt'
+static float targetHeight = 0.0f;
+static bool terrainToolsActive = false;
+static bool showGrid = false;
 
 EditorUI::EditorUI(engine::core::VulkanContext& ctx, GLFWwindow* window) : context(ctx) {
     initImGui(window);
@@ -296,8 +308,97 @@ void EditorUI::buildPanels(engine::renderer::SDFRenderer& renderer, int& selecte
 
     ImGui::End();
 
+    // --- Terrain Tools ---
+    ImGui::SetNextWindowPos(ImVec2(300, 160), ImGuiCond_FirstUseEver); // Adjust pos
+    ImGui::SetNextWindowSize(ImVec2(280, 240), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Terrain Tools", nullptr, ImGuiWindowFlags_NoCollapse);
+    
+    ImGui::Checkbox("Enable Editing", &terrainToolsActive);
+    
+    if (terrainToolsActive) {
+        ImGui::Combo("Mode", &brushMode, brushModeNames, IM_ARRAYSIZE(brushModeNames));
+        
+        if (brushMode == 4) { // Paint
+            ImGui::Combo("Layer", &paintLayer, layerNames, IM_ARRAYSIZE(layerNames));
+        }
+
+        ImGui::SliderFloat("Radius", &brushRadius, 0.01f, 0.5f);
+        ImGui::SliderFloat("Strength", &brushStrength, 0.01f, 5.0f);
+        
+        if (brushMode == 2) { // Flatten
+             ImGui::DragFloat("Target Height", &targetHeight, 0.1f, -50.0f, 50.0f);
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Debug View");
+        if (ImGui::Checkbox("Show Grid", &showGrid)) {
+            renderer.getShowGrid() = showGrid;
+        }
+
+        // Logic for applying brush
+        if (!ImGui::GetIO().WantCaptureMouse) {
+            // Trigger picking request for NEXT frame
+            ImVec2 mousePos = ImGui::GetIO().MousePos;
+            renderer.triggerPicking(mousePos.x, mousePos.y);
+
+            // Check result from LAST frame
+            auto selection = renderer.getSelection();
+            
+            // Update brush cursor visual in renderer
+            float visualRadius = (brushMode == 100) ? 0.0f : brushRadius; // Always show unless hidden
+            if (selection.hitIndex == 0) {
+                renderer.setBrush(selection.posX, selection.posY, selection.posZ, visualRadius);
+            } else {
+                renderer.setBrush(0, -1000, 0, 0); // Hide if not on ground
+            }
+            
+            // If we hit the ground (index 0) and mouse is down
+            bool mouseDown = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+            if (selection.hitIndex == 0) {
+                 // Show cursor info
+                 ImGui::Text("Target: %.2f %.2f %.2f", selection.posX, selection.posY, selection.posZ);
+                 
+                 if (mouseDown) {
+                     engine::renderer::Terrain::BrushParams params{};
+                     // Map World Pos to UV
+                     // World is centered at 0, size 256. UV 0 at -128, UV 1 at 128.
+                     params.pos.x = (selection.posX + 128.0f) / 256.0f;
+                     params.pos.y = (selection.posZ + 128.0f) / 256.0f;
+                     params.radius = brushRadius; // In UV space? Or world? 
+                     // Shader uses distance(uv, pc.pos) which is UV distance.
+                     // So we need to convert world radius to UV radius.
+                     // 256 world units = 1.0 UV units.
+                     params.radius = brushRadius / 256.0f * 10.0f; // Scale factor? Editor radius usage is arbitrary. 
+                     // Let's say brushRadius is in World Units (approx).
+                     // Then UV radius = brushRadius / 256.0f.
+                     // But brushRadius 0.1 is very small for 256 map. 
+                     // Let's treat UI brushRadius as UV fraction for now? 
+                     // Or just scale it. Let's say UI radius 0.0-0.5 is adequate for UV.
+                     params.radius = brushRadius; 
+
+                     params.strength = brushStrength * 0.01f; // Scale down for valid step
+                     params.mode = static_cast<uint32_t>(brushMode);
+                     params.layer = static_cast<uint32_t>(paintLayer);
+                     params.targetHeight = targetHeight;
+                     
+                     renderer.getTerrain().queueBrush(params);
+                 }
+            } else {
+                ImGui::Text("Hover: None/Sky");
+            }
+        } else {
+             renderer.triggerPicking(-1, -1); // Cancel picking if UI interaction
+             renderer.setBrush(0, -1000, 0, 0);
+        }
+    } else {
+        renderer.setBrush(0, -1000, 0, 0);
+        renderer.getShowGrid() = false; // Optional: auto-hide grid when tool closed
+    }
+
+    ImGui::End();
+
     // --- Controls / Info ---
-    ImGui::SetNextWindowPos(ImVec2(300, 160), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(300, 410), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(280, 80), ImGuiCond_FirstUseEver);
     ImGui::Begin("Controls", nullptr, ImGuiWindowFlags_NoCollapse);
     ImGui::TextWrapped("RMB + WASD: Fly camera\nScroll: Speed");
