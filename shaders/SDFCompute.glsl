@@ -1,340 +1,153 @@
 #version 460
+#extension GL_GOOGLE_include_directive : require
 
 // ============================================================
-// SDF Playground — GPU-Driven Edit Buffer Compute Shader
+// SDF Playground - raymarcher
+//
+// Marching uses the baked brick volume:
+//   - empty sparse-map cells are skipped in one step (stored safe distance or cell exit)
+//   - surface cells sample the 8^3 brick in the atlas with hardware trilinear filtering
+// The edit list is evaluated analytically only at the hit point (refine, normal,
+// material, picking), with per-edit bounding-sphere culling.
 // ============================================================
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(binding = 0, r16f)  uniform image3D brickAtlas;
-layout(binding = 1, r32ui) uniform uimage3D sparseMap;
-layout(binding = 2, rgba8) uniform image2D outImage;
+#define EDIT_BINDING   1
+#define VOLUME_BINDING 7
+#include "include/sdf_common.glsl"
 
-// GPU Edit struct — must match CPU SDFEdit exactly
-struct SDFEditGPU {
-    vec3  position;   float pad1;
-    vec4  rotation;
-    vec3  scale;      uint  primitiveType;
-    uint  operation;  float blendFactor;
-    uint  isDynamic;  float pad2;
-    vec3  albedo;     float roughness;
-    float metallic;   float matPad1; float matPad2; float matPad3;
-};
+layout(binding = 0, rgba8) uniform writeonly image2D outImage;
 
-layout(std430, binding = 3) buffer EditBuffer {
-    SDFEditGPU edits[];
-};
-
-layout(std430, binding = 4) buffer SelectionBuffer {
-    int hitIndex;
+layout(std430, binding = 2) buffer SelectionBuffer {
+    int   hitIndex;    // -1 none, 0 terrain, 1+ edit
     float hitPosX, hitPosY, hitPosZ;
 };
 
-layout(binding = 5) uniform sampler2D terrainHeight;
-layout(binding = 6) uniform sampler2D terrainSplat;
+layout(binding = 3) uniform sampler2D terrainHeight;
+layout(binding = 4) uniform sampler2D terrainSplat;
+layout(binding = 5) uniform sampler3D brickAtlas;
+layout(binding = 6, r32ui) uniform readonly uimage3D sparseMap;
 
+// Must match engine::renderer::RayPushConstants (96 bytes).
 layout(push_constant) uniform PushConstants {
-    vec4 camPos;     // xyz + pad
-    vec4 camDir;     // xyz + pad
-    vec4 params;     // resX, resY, time, editCount
-    uint renderMode; // 0=Lit, 1=Normals, 2=Complexity
-    uint showGround; // 1=On, 0=Off
-    float mouseX;    // -1 if not picking
-    float mouseY;
-    vec4 brushPos;   // xyz=pos, w=radius
-    uint showGrid;
-    float pad1;
-    float pad2;
-    float pad3;
-};
+    vec4  camPos;   // xyz, w = time
+    vec4  camDir;   // xyz, w = unused
+    vec4  brush;    // xyz = world pos, w = radius (0 = hidden)
+    vec4  mouse;    // xy = pixel (-1 = none), z = edit count, w = unused
+    uvec4 flags;    // x = render mode, y = show ground, z = show grid
+    uvec4 size;     // xy = resolution
+} pc;
 
-// ============== SDF Primitives ==============
+const int   MAX_STEPS = 192;
+const float MAX_DIST  = 200.0;
+const float TERRAIN_WORLD_SIZE = 256.0;
 
-float sdSphere(vec3 p, float r) {
-    return length(p) - r;
-}
+const uint MODE_LIT = 0u, MODE_NORMALS = 1u, MODE_COMPLEXITY = 2u, MODE_BRICKS = 3u;
 
-float sdBox(vec3 p, vec3 b) {
-    vec3 q = abs(p) - b;
-    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
-}
+uint editCount() { return uint(pc.mouse.z); }
 
-float sdTorus(vec3 p, vec2 t) {
-    vec2 q = vec2(length(p.xz) - t.x, p.y);
-    return length(q) - t.y;
-}
-
-float sdCapsule(vec3 p, float h, float r) {
-    p.y -= clamp(p.y, 0.0, h);
-    return length(p) - r;
-}
-
-float sdCylinder(vec3 p, float h, float r) {
-    vec2 d = abs(vec2(length(p.xz), p.y)) - vec2(r, h);
-    return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
-}
-
-float sdPlane(vec3 p) {
-    return p.y;
-}
+// ---------------- Terrain (heightfield, outside the brick volume) ----------------
 
 float sdTerrain(vec3 p) {
-    const float worldSize = 256.0;
-    vec2 uv = (p.xz + worldSize * 0.5) / worldSize;
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return p.y;
-    
+    vec2 uv = (p.xz + TERRAIN_WORLD_SIZE * 0.5) / TERRAIN_WORLD_SIZE;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return p.y;
     float h = textureLod(terrainHeight, uv, 0.0).r;
-    return (p.y - h) * 0.5; // Conservative step
+    return (p.y - h) * 0.5; // heightfields are not true SDFs; halve the step to stay conservative
 }
 
-vec4 getTerrainMaterial(vec3 p) {
-    const float worldSize = 256.0;
-    vec2 uv = (p.xz + worldSize * 0.5) / worldSize;
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return vec4(0.5, 0.8, 0.0, 0.0);
+float groundDist(vec3 p) { return pc.flags.y == 1u ? sdTerrain(p) : BIG; }
 
-    vec4 splat = textureLod(terrainSplat, uv, 0.0);
-    
-    // Define 4 materials
-    // Mat 0 (Red ch): Grass
-    vec3 col0 = vec3(0.1, 0.4, 0.1); float rough0 = 0.9; float met0 = 0.0;
-    // Mat 1 (Green ch): Dirt
-    vec3 col1 = vec3(0.4, 0.3, 0.2); float rough1 = 1.0; float met1 = 0.0;
-    // Mat 2 (Blue ch): Rock
-    vec3 col2 = vec3(0.5, 0.5, 0.5); float rough2 = 0.7; float met2 = 0.0;
-    // Mat 3 (Alpha ch): Snow
-    vec3 col3 = vec3(0.9, 0.9, 0.95); float rough3 = 0.3; float met3 = 0.0;
-    
-    vec3 albedo = col0 * splat.r + col1 * splat.g + col2 * splat.b + col3 * splat.a;
-    float roughness = rough0 * splat.r + rough1 * splat.g + rough2 * splat.b + rough3 * splat.a;
-    float metallic = met0 * splat.r + met1 * splat.g + met2 * splat.b + met3 * splat.a;
-    
-    // Normalize if sum > 1 (it should be roughly 1)
-    float sum = dot(splat, vec4(1.0));
-    if (sum > 0.001) {
-        albedo /= sum;
-        roughness /= sum;
-        metallic /= sum;
-    }
-    
-    return vec4(albedo, roughness); // pack roughness in A? No, wait.
-    // Return struct-like? No, vec4 is rigid. 
-    // Let's just return a packed vec4: rgb=albedo, a=roughness. Metallic separate?
-    // Metallic is mostly 0 for terrain.
-}
+// ---------------- Brick volume queries ----------------
 
-// ============== SDF for a single edit ==============
+vec3 volumeMin() { return vol.originVoxel.xyz; }
+vec3 volumeMax() { return vol.originVoxel.xyz + vec3(vol.gridDim.xyz) * cellSize(); }
 
-float evalPrimitive(vec3 p, SDFEditGPU e) {
-    vec3 lp = p - e.position;
-    
-    switch (e.primitiveType) {
-        case 0: return sdSphere(lp, e.scale.x);
-        case 1: return sdBox(lp, e.scale);
-        case 2: return sdTorus(lp, vec2(e.scale.x, e.scale.y));
-        case 3: return sdCapsule(lp, e.scale.y, e.scale.x);
-        case 4: return sdCylinder(lp, e.scale.y, e.scale.x);
-        default: return sdSphere(lp, e.scale.x);
-    }
-}
+// Distance to the edit field at p.
+//   isBrick = true : trilinear brick sample (accurate near the surface)
+//   isBrick = false: conservative lower bound (empty cell or outside the volume)
+float volumeQuery(vec3 p, out bool isBrick, out ivec3 cell, out bool inside) {
+    isBrick = false;
+    vec3 g = (p - volumeMin()) / cellSize();
+    cell = ivec3(floor(g));
+    inside = all(greaterThanEqual(cell, ivec3(0))) && all(lessThan(cell, ivec3(vol.gridDim.xyz)));
 
-// ============== Boolean Operations ==============
-
-float opUnion(float d1, float d2) { return min(d1, d2); }
-float opSubtract(float d1, float d2) { return max(d1, -d2); }
-float opIntersect(float d1, float d2) { return max(d1, d2); }
-
-float opSmoothUnion(float d1, float d2, float k) {
-    float h = clamp(0.5 + 0.5 * (d2 - d1) / k, 0.0, 1.0);
-    return mix(d2, d1, h) - k * h * (1.0 - h);
-}
-
-float opSmoothSub(float d1, float d2, float k) {
-    float h = clamp(0.5 - 0.5 * (d1 + d2) / k, 0.0, 1.0);
-    return mix(d1, -d2, h) + k * h * (1.0 - h);
-}
-
-// ============== Scene (ground + edits) ==============
-
-struct HitResult {
-    float dist;
-    vec3  albedo;
-    float roughness;
-    float metallic;
-    int   index; // -1 for sky/nothing, 0 for ground, 1+ for edits
-};
-
-HitResult mapScene(vec3 p) {
-    int count = int(params.w);
-    
-    // Start with infinite distance
-    HitResult res;
-    res.dist = 1e10;
-    res.albedo = vec3(0.5);
-    res.roughness = 0.8;
-    res.metallic = 0.0;
-    res.index = -1;
-
-    // Ground plane (optional)
-    if (showGround == 1) {
-        float ground = sdTerrain(p);
-        if (ground < res.dist) {
-            res.dist = ground;
-            
-            // Material from splatmap
-            const float worldSize = 256.0;
-            vec2 uv = (p.xz + worldSize * 0.5) / worldSize;
-            
-            if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
-                 vec4 splat = textureLod(terrainSplat, uv, 0.0);
-                 
-                // Mat 0 (Red ch): Grass
-                vec3 col0 = vec3(0.1, 0.4, 0.1); float rough0 = 0.9; float met0 = 0.0;
-                // Mat 1 (Green ch): Dirt
-                vec3 col1 = vec3(0.4, 0.3, 0.2); float rough1 = 1.0; float met1 = 0.0;
-                // Mat 2 (Blue ch): Rock
-                vec3 col2 = vec3(0.5, 0.5, 0.5); float rough2 = 0.7; float met2 = 0.0;
-                // Mat 3 (Alpha ch): Snow
-                vec3 col3 = vec3(0.9, 0.9, 0.95); float rough3 = 0.3; float met3 = 0.0;
-                
-                res.albedo = col0 * splat.r + col1 * splat.g + col2 * splat.b + col3 * splat.a;
-                res.roughness = rough0 * splat.r + rough1 * splat.g + rough2 * splat.b + rough3 * splat.a;
-                res.metallic = met0 * splat.r + met1 * splat.g + met2 * splat.b + met3 * splat.a;
-                
-                float sum = dot(splat, vec4(1.0));
-                if (sum > 0.001) {
-                    res.albedo /= sum;
-                    res.roughness /= sum;
-                    res.metallic /= sum;
-                }
-            } else {
-                 // Checkerboard fallback
-                float checker = mod(floor(p.x * 0.5) + floor(p.z * 0.5), 2.0);
-                res.albedo = mix(vec3(0.35, 0.38, 0.42), vec3(0.55, 0.58, 0.62), checker);
-                res.roughness = 0.9;
-                res.metallic = 0.0;
-            }
-
-            // --- Debug Grid ---
-            if (showGrid == 1) {
-                // World space grid
-                float gridSize = 1.0;
-                float lineThickness = 0.02;
-                
-                // Simple non-anti-aliased grid for now to avoid derivative issues in compute
-                vec2 g = abs(fract(p.xz / gridSize - 0.5) - 0.5);
-                float gLine = min(g.x, g.y);
-                if (gLine < lineThickness) {
-                    res.albedo = mix(res.albedo, vec3(0.8), 0.5); // Light grid
-                }
-                
-                // Major grid
-                vec2 gMajor = abs(fract(p.xz / 10.0) - 0.5);
-                float gMajorLine = min(gMajor.x, gMajor.y);
-                if (gMajorLine < 0.005) { // 0.005 * 10 = 0.05
-                    res.albedo = mix(res.albedo, vec3(1.0), 0.6); // White major lines
-                }
-            }
-
-            // --- Brush Cursor ---
-            if (brushPos.w > 0.0) {
-                 float dist = distance(p, brushPos.xyz);
-                 float ringWidth = 0.1;
-                 
-                 // Ring
-                 if (abs(dist - brushPos.w) < ringWidth) {
-                     res.albedo = mix(res.albedo, vec3(1.0, 0.5, 0.0), 0.8); // Orange ring
-                 }
-                 // Area
-                 else if (dist < brushPos.w) {
-                     res.albedo = mix(res.albedo, vec3(1.0, 0.5, 0.0), 0.1); // Faint orange fill
-                 }
-            }
-            
-            res.index = 0; // Ground index
-        }
+    if (!inside) {
+        // Everything is clipped to the volume, so the distance to its box is safe.
+        vec3 c = 0.5 * (volumeMin() + volumeMax());
+        return max(sdBox(p - c, 0.5 * (volumeMax() - volumeMin())), 0.0);
     }
 
-    // Evaluate each edit
-    for (int i = 0; i < count && i < 256; i++) {
-        SDFEditGPU e = edits[i];
-        float d = evalPrimitive(p, e);
+    uint v = imageLoad(sparseMap, cell).r;
+    if ((v & BRICK_FLAG) == 0u) return uintBitsToFloat(v);
 
-        float prevDist = res.dist;
-        
-        switch (e.operation) {
-            case 0: // Union
-                if (d < res.dist) {
-                    res.dist = d;
-                    res.albedo = e.albedo;
-                    res.roughness = e.roughness;
-                    res.metallic = e.metallic;
-                    res.index = i + 1; // Edit index (1-based because 0 is ground)
-                }
-                break;
-            case 1: // Subtraction
-            {
-                float newDist = opSubtract(res.dist, d);
-                // Subtraction keeps base material/index
-                res.dist = newDist;
-                break;
-            }
-            case 2: // Intersection
-            {
-                float newDist = opIntersect(res.dist, d);
-                // If intersection is closer to the new part, swap index?
-                // For simplicity, we keep the previous index for now or take the new one if closer
-                if (newDist < res.dist && d < res.dist) {
-                    res.index = i + 1;
-                }
-                res.dist = newDist;
-                break;
-            }
-            case 3: // Smooth Union
-            {
-                float k = max(e.blendFactor, 0.01);
-                float newDist = opSmoothUnion(res.dist, d, k);
-                float h = clamp(0.5 + 0.5 * (d - prevDist) / k, 0.0, 1.0);
-                res.albedo = mix(e.albedo, res.albedo, h);
-                res.roughness = mix(e.roughness, res.roughness, h);
-                res.metallic = mix(e.metallic, res.metallic, h);
-                if (h < 0.5) res.index = i + 1; // Take index of the "closer" or "more dominant" part
-                res.dist = newDist;
-                break;
-            }
-            case 4: // Smooth Subtraction
-            {
-                float k = max(e.blendFactor, 0.01);
-                float newDist = opSmoothSub(res.dist, d, k);
-                float h = clamp(0.5 - 0.5 * (res.dist + d) / k, 0.0, 1.0);
-                res.albedo = mix(res.albedo, e.albedo, h * 0.5); 
-                res.dist = newDist;
-                break;
-            }
-        }
-    }
-
-    return res;
+    isBrick = true;
+    uvec3 b = brickAtlasCoord(v & BRICK_MASK);
+    vec3 local = clamp((p - cellMin(uvec3(cell))) / voxelSize(), vec3(0.0), vec3(BRICK_SAMPLES - 1));
+    vec3 atlasTexels = vec3(vol.atlasBricks.xyz * uint(BRICK_SAMPLES));
+    vec3 uvw = (vec3(b * uint(BRICK_SAMPLES)) + local + 0.5) / atlasTexels;
+    return textureLod(brickAtlas, uvw, 0.0).r;
 }
 
-// ============== Lighting ==============
-
-vec3 calcNormal(vec3 p) {
-    const float h = 0.001;
-    return normalize(vec3(
-        mapScene(p + vec3(h, 0, 0)).dist - mapScene(p - vec3(h, 0, 0)).dist,
-        mapScene(p + vec3(0, h, 0)).dist - mapScene(p - vec3(0, h, 0)).dist,
-        mapScene(p + vec3(0, 0, h)).dist - mapScene(p - vec3(0, 0, h)).dist
-    ));
+float cellExitDist(vec3 p, vec3 rd, ivec3 cell) {
+    vec3 safeRd = mix(rd, vec3(1e-8), lessThan(abs(rd), vec3(1e-8)));
+    vec3 bmin = cellMin(uvec3(cell));
+    vec3 t1 = (bmin - p) / safeRd;
+    vec3 t2 = (bmin + cellSize() - p) / safeRd;
+    vec3 tmax = max(t1, t2);
+    return min(tmax.x, min(tmax.y, tmax.z));
 }
+
+// Safe step along rd for the edit field.
+float editsStep(vec3 p, vec3 rd, out bool isBrick) {
+    ivec3 cell; bool inside;
+    float d = volumeQuery(p, isBrick, cell, inside);
+    if (isBrick || !inside) return d;
+    // Empty cell: no surface inside, so jump at least to its far side.
+    return max(d, cellExitDist(p, rd, cell) + 1e-3 * cellSize());
+}
+
+float editsPoint(vec3 p) {
+    bool isBrick, inside; ivec3 cell;
+    return volumeQuery(p, isBrick, cell, inside);
+}
+
+// ---------------- Normals (tetrahedron technique, 4 taps) ----------------
+
+vec3 editNormal(vec3 p) {
+    const vec2 k = vec2(1.0, -1.0);
+    float h = 0.5 * voxelSize();
+    float band = 4.0 * voxelSize();
+    uint n = editCount();
+    return normalize(k.xyy * evalEditsDist(p + k.xyy * h, n, band) +
+                     k.yyx * evalEditsDist(p + k.yyx * h, n, band) +
+                     k.yxy * evalEditsDist(p + k.yxy * h, n, band) +
+                     k.xxx * evalEditsDist(p + k.xxx * h, n, band));
+}
+
+vec3 terrainNormal(vec3 p) {
+    const vec2 k = vec2(1.0, -1.0);
+    const float h = 0.15;
+    return normalize(k.xyy * sdTerrain(p + k.xyy * h) +
+                     k.yyx * sdTerrain(p + k.yyx * h) +
+                     k.yxy * sdTerrain(p + k.yxy * h) +
+                     k.xxx * sdTerrain(p + k.xxx * h));
+}
+
+// ---------------- Lighting ----------------
 
 float softShadow(vec3 ro, vec3 rd, float mint, float maxt, float k) {
     float res = 1.0;
     float t = mint;
-    for (int i = 0; i < 32 && t < maxt; i++) {
-        float h = mapScene(ro + rd * t).dist;
-        if (h < 0.001) return 0.0;
-        res = min(res, k * h / t);
-        t += clamp(h, 0.02, 0.5);
+    for (int i = 0; i < 64 && t < maxt; i++) {
+        vec3 p = ro + rd * t;
+        bool isBrick;
+        float dE = editsStep(p, rd, isBrick);
+        float dG = groundDist(p);
+        float hitDist = min(isBrick ? dE : BIG, dG);
+        if (hitDist < 0.001) return 0.0;
+        res = min(res, k * hitDist / t);
+        t += max(min(dE, dG), 0.02);
     }
     return clamp(res, 0.0, 1.0);
 }
@@ -344,15 +157,15 @@ float calcAO(vec3 p, vec3 n) {
     float sca = 1.0;
     for (int i = 0; i < 5; i++) {
         float h = 0.02 + 0.12 * float(i);
-        float d = mapScene(p + n * h).dist;
-        occ += (h - d) * sca;
+        vec3 q = p + n * h;
+        float d = min(editsPoint(q), groundDist(q));
+        occ += (h - min(d, h)) * sca;
         sca *= 0.75;
     }
     return clamp(1.0 - 1.5 * occ, 0.0, 1.0);
 }
 
 vec3 shade(vec3 p, vec3 n, vec3 viewDir, vec3 albedo, float roughness, float metallic) {
-    // Two lights
     vec3 lightDir1 = normalize(vec3(0.6, 0.8, -0.4));
     vec3 lightDir2 = normalize(vec3(-0.4, 0.5, 0.7));
     vec3 lightCol1 = vec3(1.4, 1.3, 1.2);
@@ -360,116 +173,155 @@ vec3 shade(vec3 p, vec3 n, vec3 viewDir, vec3 albedo, float roughness, float met
 
     float diff1 = max(dot(n, lightDir1), 0.0);
     float diff2 = max(dot(n, lightDir2), 0.0);
-    
-    float shadow1 = softShadow(p + n * 0.01, lightDir1, 0.02, 20.0, 12.0);
-    
+    float shadow1 = diff1 > 0.0 ? softShadow(p + n * 0.02, lightDir1, 0.02, 30.0, 12.0) : 0.0;
+
     vec3 h1 = normalize(lightDir1 + viewDir);
     float spec1 = pow(max(dot(n, h1), 0.0), mix(8.0, 128.0, 1.0 - roughness));
     float specIntensity = mix(0.04, 1.0, metallic);
 
     float ao = calcAO(p, n);
-    
-    vec3 ambient = vec3(0.08, 0.09, 0.12) * ao;
-    vec3 color = ambient * albedo;
+
+    vec3 color = vec3(0.08, 0.09, 0.12) * ao * albedo;
     color += albedo * lightCol1 * diff1 * shadow1;
     color += albedo * lightCol2 * diff2 * 0.3;
     color += vec3(specIntensity) * lightCol1 * spec1 * shadow1;
-    
     return color;
 }
 
-// ACES tone mapping
 vec3 ACESFilm(vec3 x) {
-    float a = 2.51;
-    float b = 0.03;
-    float c = 2.43;
-    float d = 0.59;
-    float e = 0.14;
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
-// ============== Main ==============
+// ---------------- Terrain material + overlays ----------------
+
+void terrainMaterial(vec3 p, out vec3 albedo, out float roughness, out float metallic) {
+    metallic = 0.0;
+    vec2 uv = (p.xz + TERRAIN_WORLD_SIZE * 0.5) / TERRAIN_WORLD_SIZE;
+    if (all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)))) {
+        vec4 splat = textureLod(terrainSplat, uv, 0.0);
+        const vec3 col[4] = vec3[4](vec3(0.1, 0.4, 0.1), vec3(0.4, 0.3, 0.2), vec3(0.5), vec3(0.9, 0.9, 0.95));
+        const vec4 rough = vec4(0.9, 1.0, 0.7, 0.3);
+        float sum = max(dot(splat, vec4(1.0)), 0.001);
+        albedo = (col[0] * splat.r + col[1] * splat.g + col[2] * splat.b + col[3] * splat.a) / sum;
+        roughness = dot(rough, splat) / sum;
+    } else {
+        float checker = mod(floor(p.x * 0.5) + floor(p.z * 0.5), 2.0);
+        albedo = mix(vec3(0.35, 0.38, 0.42), vec3(0.55, 0.58, 0.62), checker);
+        roughness = 0.9;
+    }
+
+    if (pc.flags.z == 1u) {
+        vec2 g = abs(fract(p.xz - 0.5) - 0.5);
+        if (min(g.x, g.y) < 0.02) albedo = mix(albedo, vec3(0.8), 0.5);
+        vec2 gMajor = abs(fract(p.xz / 10.0) - 0.5);
+        if (min(gMajor.x, gMajor.y) < 0.005) albedo = mix(albedo, vec3(1.0), 0.6);
+    }
+
+    if (pc.brush.w > 0.0) {
+        float dist = distance(p.xz, pc.brush.xz);
+        if (abs(dist - pc.brush.w) < 0.1) albedo = mix(albedo, vec3(1.0, 0.5, 0.0), 0.8);
+        else if (dist < pc.brush.w)       albedo = mix(albedo, vec3(1.0, 0.5, 0.0), 0.1);
+    }
+}
+
+vec3 hashColor(uint x) {
+    x = (x ^ 61u) ^ (x >> 16u); x *= 9u; x ^= x >> 4u; x *= 0x27d4eb2du; x ^= x >> 15u;
+    return vec3(x & 255u, (x >> 8u) & 255u, (x >> 16u) & 255u) / 255.0;
+}
+
+// ---------------- Main ----------------
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 size = ivec2(params.x, params.y);
-    
+    ivec2 size = ivec2(pc.size.xy);
     if (pixel.x >= size.x || pixel.y >= size.y) return;
 
     vec2 uv = (vec2(pixel) + 0.5) / vec2(size) * 2.0 - 1.0;
-    uv.y = -uv.y; // Vulkan Y flip
+    uv.y = -uv.y;
     uv.x *= float(size.x) / float(size.y);
 
-    // Camera setup
-    vec3 ro = camPos.xyz;
-    vec3 forward = normalize(camDir.xyz);
-    vec3 worldUp = vec3(0, 1, 0);
-    vec3 right = normalize(cross(forward, worldUp));
+    vec3 ro = pc.camPos.xyz;
+    vec3 forward = normalize(pc.camDir.xyz);
+    vec3 right = normalize(cross(forward, vec3(0, 1, 0)));
     vec3 up = cross(right, forward);
-    float fov = 1.0;
-    vec3 rd = normalize(forward * fov + right * uv.x + up * uv.y);
+    vec3 rd = normalize(forward + right * uv.x + up * uv.y);
 
-    // Ray march
+    // ---- March ----
     float t = 0.0;
-    HitResult hit;
-    hit.dist = 1e10;
-    hit.index = -1;
-    bool hitSurface = false;
     int steps = 0;
-
-    for (int i = 0; i < 128; i++) {
+    int hitKind = -1; // 0 terrain, 1 edits
+    for (int i = 0; i < MAX_STEPS; i++) {
         steps++;
         vec3 p = ro + rd * t;
-        hit = mapScene(p);
-        if (hit.dist < 0.001) {
-            hitSurface = true;
-            break;
-        }
-        if (t > 100.0) break;
-        t += hit.dist;
+        bool isBrick;
+        float dE = editsStep(p, rd, isBrick);
+        float dG = groundDist(p);
+        float eps = 0.0005 + 0.0005 * t;
+        if (isBrick && dE < eps) { hitKind = 1; break; }
+        if (dG < eps)            { hitKind = 0; break; }
+        t += min(dE, dG);
+        if (t > MAX_DIST) break;
     }
 
-    // Write selection result if this pixel is the target
-    if (pixel.x == int(mouseX) && pixel.y == int(mouseY)) {
-        hitIndex = hitSurface ? hit.index : -1;
-        vec3 hp = ro + rd * t;
-        hitPosX = hp.x;
-        hitPosY = hp.y;
-        hitPosZ = hp.z;
+    // ---- Resolve hit ----
+    vec3 p = ro + rd * t;
+    vec3 n = vec3(0, 1, 0);
+    vec3 albedo = vec3(0.5);
+    float roughness = 0.8, metallic = 0.0;
+    int index = -1;
+    uint brickId = 0u;
+
+    if (hitKind == 1) {
+        // Snap from the quantized brick surface to the exact analytic surface.
+        float band = 4.0 * voxelSize();
+        EditHit h = evalEditsMaterial(p, editCount(), band);
+        for (int i = 0; i < 2; ++i) {
+            t += clamp(h.dist, -voxelSize(), voxelSize());
+            p = ro + rd * t;
+            h = evalEditsMaterial(p, editCount(), band);
+        }
+        n = editNormal(p);
+        albedo = h.albedo; roughness = h.roughness; metallic = h.metallic;
+        index = h.index;
+
+        ivec3 cell = ivec3(floor((p - volumeMin()) / cellSize()));
+        uint v = imageLoad(sparseMap, clamp(cell, ivec3(0), ivec3(vol.gridDim.xyz) - 1)).r;
+        brickId = (v & BRICK_FLAG) != 0u ? (v & BRICK_MASK) + 1u : 0u;
+    } else if (hitKind == 0) {
+        n = terrainNormal(p);
+        terrainMaterial(p, albedo, roughness, metallic);
+        index = 0;
     }
 
-    vec3 color = vec3(0);
-    if (renderMode == 2) { // Complexity
-        float c = float(steps) / 128.0;
-        color = vec3(c * c, c, 0.5 * c); // Heatmap
-    } else if (hitSurface) {
-        vec3 p = ro + rd * t;
-        vec3 n = calcNormal(p);
-        
-        if (renderMode == 1) { // Normals
-            color = n * 0.5 + 0.5;
-        } else { // Lit
-            vec3 viewDir = -rd;
-            color = shade(p, n, viewDir, hit.albedo, hit.roughness, hit.metallic);
-            
-            // Distance fog
-            float fog = 1.0 - exp(-0.003 * t * t);
-            vec3 fogColor = vec3(0.45, 0.50, 0.60);
-            color = mix(color, fogColor, fog);
-        }
-    } else {
-        // Sky gradient
+    // ---- Picking: one pixel writes the result for the CPU ----
+    if (pixel == ivec2(pc.mouse.xy)) {
+        hitIndex = index;
+        hitPosX = p.x; hitPosY = p.y; hitPosZ = p.z;
+    }
+
+    // ---- Shade ----
+    vec3 color;
+    uint mode = pc.flags.x;
+    if (mode == MODE_COMPLEXITY) {
+        float c = float(steps) / float(MAX_STEPS);
+        color = vec3(c * c, c, 0.5 * c);
+    } else if (hitKind < 0) {
         float skyT = 0.5 * (rd.y + 1.0);
         color = mix(vec3(0.45, 0.50, 0.60), vec3(0.20, 0.30, 0.55), skyT);
+    } else if (mode == MODE_NORMALS) {
+        color = n * 0.5 + 0.5;
+    } else if (mode == MODE_BRICKS) {
+        color = hitKind == 1 ? hashColor(brickId) * (0.4 + 0.6 * max(dot(n, normalize(vec3(0.6, 0.8, -0.4))), 0.0))
+                             : vec3(0.15);
+    } else {
+        color = shade(p, n, -rd, albedo, roughness, metallic);
+        float fog = 1.0 - exp(-0.003 * t * t);
+        color = mix(color, vec3(0.45, 0.50, 0.60), fog);
     }
 
-    // Tone map + gamma
-    if (renderMode == 0) {
-        color = ACESFilm(color);
-        color = pow(color, vec3(1.0 / 2.2));
-    } else if (renderMode == 1) {
-        color = pow(color, vec3(1.0 / 2.2));
-    }
+    if (mode == MODE_LIT) color = ACESFilm(color);
+    if (mode == MODE_LIT || mode == MODE_NORMALS) color = pow(color, vec3(1.0 / 2.2));
 
     imageStore(outImage, pixel, vec4(color, 1.0));
 }

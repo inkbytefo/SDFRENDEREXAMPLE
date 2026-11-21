@@ -1,360 +1,254 @@
 #include "SDFRenderer.hpp"
-#include <cstring>
+
 #include <GLFW/glfw3.h>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 
 namespace engine::renderer {
 
-SDFRenderer::SDFRenderer(core::VulkanContext& context) : context(context) {
-    descriptorManager = std::make_unique<DescriptorManager>(context.getDevice());
+static const vk::ImageSubresourceRange kColorRange{ vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1 };
+
+SDFRenderer::SDFRenderer(core::VulkanContext& ctx) : context(ctx) {
+    auto device = context.getDevice();
+    auto& rm = context.getResourceManager();
 
     terrain = std::make_unique<Terrain>(context);
 
-    // Create a linear sampler for terrain
+    // Per-frame host-visible buffers, persistently mapped.
+    const vk::DeviceSize editBytes = sizeof(core::SDFEdit) * MAX_EDITS;
+    std::array<vk::Buffer, FRAMES> editHandles{};
+    for (uint32_t f = 0; f < FRAMES; ++f) {
+        editBuffers[f] = rm.createBuffer(editBytes, vk::BufferUsageFlagBits::eStorageBuffer,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        editMapped[f] = device.mapMemory(editBuffers[f].memory.get(), 0, editBytes);
+        std::memset(editMapped[f], 0, editBytes);
+        editHandles[f] = editBuffers[f].buffer.get();
+
+        selectionBuffers[f] = rm.createBuffer(sizeof(SelectionData), vk::BufferUsageFlagBits::eStorageBuffer,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        selectionMapped[f] = static_cast<SelectionData*>(
+            device.mapMemory(selectionBuffers[f].memory.get(), 0, sizeof(SelectionData)));
+        *selectionMapped[f] = SelectionData{};
+    }
+
+    volume = std::make_unique<BrickVolume>(context, BrickVolume::Config{}, editHandles, editBytes);
+
     vk::SamplerCreateInfo samplerInfo{};
     samplerInfo.magFilter = vk::Filter::eLinear;
     samplerInfo.minFilter = vk::Filter::eLinear;
+    samplerInfo.mipmapMode = vk::SamplerMipmapMode::eNearest;
     samplerInfo.addressModeU = vk::SamplerAddressMode::eClampToEdge;
     samplerInfo.addressModeV = vk::SamplerAddressMode::eClampToEdge;
     samplerInfo.addressModeW = vk::SamplerAddressMode::eClampToEdge;
-    samplerInfo.anisotropyEnable = VK_FALSE;
-    samplerInfo.maxAnisotropy = 1.0f;
-    samplerInfo.borderColor = vk::BorderColor::eIntOpaqueBlack;
-    samplerInfo.unnormalizedCoordinates = VK_FALSE;
-    samplerInfo.compareEnable = VK_FALSE;
-    samplerInfo.compareOp = vk::CompareOp::eAlways;
-    samplerInfo.mipmapMode = vk::SamplerMipmapMode::eLinear;
-    samplerInfo.mipLodBias = 0.0f;
-    samplerInfo.minLod = 0.0f;
     samplerInfo.maxLod = 0.0f;
+    linearSampler = device.createSamplerUnique(samplerInfo);
 
-    terrainSampler = context.getDevice().createSampler(samplerInfo);
+    descriptors = std::make_unique<DescriptorManager>(device);
+    const auto cs = vk::ShaderStageFlagBits::eCompute;
+    setLayout = descriptors->createLayout({
+        { 0, vk::DescriptorType::eStorageImage,         1, cs }, // output
+        { 1, vk::DescriptorType::eStorageBuffer,        1, cs }, // edits (per frame)
+        { 2, vk::DescriptorType::eStorageBuffer,        1, cs }, // selection (per frame)
+        { 3, vk::DescriptorType::eCombinedImageSampler, 1, cs }, // terrain height
+        { 4, vk::DescriptorType::eCombinedImageSampler, 1, cs }, // terrain splat
+        { 5, vk::DescriptorType::eCombinedImageSampler, 1, cs }, // brick atlas
+        { 6, vk::DescriptorType::eStorageImage,         1, cs }, // sparse map
+        { 7, vk::DescriptorType::eUniformBuffer,        1, cs }, // volume params
+    });
+    for (auto& s : sets) s = descriptors->allocateSet(setLayout);
 
-    std::vector<vk::DescriptorSetLayoutBinding> bindings = {
-        { 0, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute },  // Brick Atlas
-        { 1, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute },  // Sparse Map
-        { 2, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute },  // Out Image
-        { 3, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute }, // Edit Buffer
-        { 4, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute }, // Selection Buffer
-        { 5, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute }, // Terrain Height
-        { 6, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute }  // Terrain Splat
-    };
-    descriptorSetLayout = descriptorManager->createLayout(bindings);
-    descriptorSet = descriptorManager->allocateSet(descriptorSetLayout);
+    vk::PushConstantRange push{ cs, 0, sizeof(RayPushConstants) };
+    pipeline = std::make_unique<ComputePipeline>(device, "SDFCompute.spv",
+                                                 std::vector<vk::DescriptorSetLayout>{ setLayout },
+                                                 std::vector<vk::PushConstantRange>{ push });
 
-    // Create SDF Edit buffer (max 256 edits)
-    editBuffer = context.getResourceManager().createBuffer(
-        sizeof(core::SDFEdit) * 256,
-        vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
-        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent
-    );
-
-    // Create selection buffer (hit index + vec3 pos)
-    selectionBuffer = context.getResourceManager().createBuffer(
-        sizeof(SelectionData),
-        vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc,
-        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent
-    );
-
-    SelectionData clearVal{-1, 0, 0, 0};
-    void* clearPtr = context.getDevice().mapMemory(selectionBuffer.memory.get(), 0, sizeof(SelectionData));
-    std::memcpy(clearPtr, &clearVal, sizeof(SelectionData));
-    context.getDevice().unmapMemory(selectionBuffer.memory.get());
-
-    // Push constant range
-    vk::PushConstantRange pushConstantRange{};
-    pushConstantRange.stageFlags = vk::ShaderStageFlagBits::eCompute;
-    pushConstantRange.offset = 0;
-    pushConstantRange.size = sizeof(PushConstants);
-
-    computePipeline = std::make_unique<ComputePipeline>(
-        context.getDevice(), 
-        "shaders/SDFCompute.spv", 
-        std::vector<vk::DescriptorSetLayout>{ descriptorSetLayout },
-        std::vector<vk::PushConstantRange>{ pushConstantRange }
-    );
-
-    auto extent = context.getSwapchain()->getExtent();
-    outputWidth = extent.width;
-    outputHeight = extent.height;
-
-    outputImage = context.getResourceManager().createImage(
-        outputWidth, outputHeight, 1,
-        vk::Format::eR8G8B8A8Unorm,
-        vk::ImageTiling::eOptimal,
-        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc,
-        vk::MemoryPropertyFlagBits::eDeviceLocal,
-        vk::ImageViewType::e2D
-    );
-
-    pushConstants.camPosX = camPosX;
-    pushConstants.camPosY = camPosY;
-    pushConstants.camPosZ = camPosZ;
-    pushConstants.resX = static_cast<float>(outputWidth);
-    pushConstants.resY = static_cast<float>(outputHeight);
-    pushConstants.time = 0.0f;
-    pushConstants.editCount = 0.0f;
-    pushConstants.mouseX = -1.0f;
-    pushConstants.mouseY = -1.0f;
-    pushConstants.renderMode = renderMode;
-    pushConstants.showGround = showGround ? 1 : 0;
-    pushConstants.brushX = 0;
-    pushConstants.brushY = 0;
-    pushConstants.brushZ = 0;
-    pushConstants.brushRadius = 0;
-    pushConstants.showGrid = showGrid ? 1 : 0;
-
-    createDescriptorSets();
+    createOutputImage(context.getSwapchain()->getExtent());
+    writeDescriptorSets();
 }
 
 SDFRenderer::~SDFRenderer() {
-    if (terrainSampler) {
-        context.getDevice().destroySampler(terrainSampler);
+    context.getDevice().waitIdle();
+    for (uint32_t f = 0; f < FRAMES; ++f) {
+        context.getDevice().unmapMemory(editBuffers[f].memory.get());
+        context.getDevice().unmapMemory(selectionBuffers[f].memory.get());
     }
+}
+
+void SDFRenderer::createOutputImage(vk::Extent2D extent) {
+    outputWidth = std::max(1u, extent.width);
+    outputHeight = std::max(1u, extent.height);
+    outputImage = context.getResourceManager().createImage(
+        outputWidth, outputHeight, 1, vk::Format::eR8G8B8A8Unorm, vk::ImageTiling::eOptimal,
+        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc,
+        vk::MemoryPropertyFlagBits::eDeviceLocal, vk::ImageViewType::e2D);
+}
+
+void SDFRenderer::resize(vk::Extent2D extent) {
+    context.getDevice().waitIdle();
+    createOutputImage(extent);
+    writeDescriptorSets();
+}
+
+void SDFRenderer::writeDescriptorSets() {
+    vk::DescriptorImageInfo outInfo{ nullptr, outputImage.view.get(), vk::ImageLayout::eGeneral };
+    vk::DescriptorImageInfo heightInfo{ linearSampler.get(), terrain->getHeightmap().view.get(), vk::ImageLayout::eGeneral };
+    vk::DescriptorImageInfo splatInfo{ linearSampler.get(), terrain->getSplatmap().view.get(), vk::ImageLayout::eGeneral };
+    vk::DescriptorImageInfo atlasInfo{ linearSampler.get(), volume->getAtlasView(), vk::ImageLayout::eGeneral };
+    vk::DescriptorImageInfo mapInfo{ nullptr, volume->getMapView(), vk::ImageLayout::eGeneral };
+    vk::DescriptorBufferInfo paramsInfo{ volume->getParamsBuffer(), 0, sizeof(VolumeParams) };
+
+    for (uint32_t f = 0; f < FRAMES; ++f) {
+        vk::DescriptorBufferInfo editInfo{ editBuffers[f].buffer.get(), 0, VK_WHOLE_SIZE };
+        vk::DescriptorBufferInfo selInfo{ selectionBuffers[f].buffer.get(), 0, sizeof(SelectionData) };
+        descriptors->updateSet(sets[f], {
+            { sets[f], 0, 0, 1, vk::DescriptorType::eStorageImage, &outInfo },
+            { sets[f], 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &editInfo },
+            { sets[f], 2, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &selInfo },
+            { sets[f], 3, 0, 1, vk::DescriptorType::eCombinedImageSampler, &heightInfo },
+            { sets[f], 4, 0, 1, vk::DescriptorType::eCombinedImageSampler, &splatInfo },
+            { sets[f], 5, 0, 1, vk::DescriptorType::eCombinedImageSampler, &atlasInfo },
+            { sets[f], 6, 0, 1, vk::DescriptorType::eStorageImage, &mapInfo },
+            { sets[f], 7, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &paramsInfo },
+        });
+    }
+}
+
+void SDFRenderer::beginFrame(uint32_t frame) {
+    // The fence for this slot has signaled, so the GPU is done with its selection buffer.
+    SelectionData result = *selectionMapped[frame];
+    hover = result;
+    if (clickInFlight[frame]) {
+        clickResult = result;
+        clickInFlight[frame] = false;
+    }
+    *selectionMapped[frame] = SelectionData{};
+    volume->collectStats(frame);
+}
+
+std::optional<SDFRenderer::SelectionData> SDFRenderer::takeClickResult() {
+    auto r = clickResult;
+    clickResult.reset();
+    return r;
 }
 
 void SDFRenderer::update(float deltaTime, const core::InputState& input, bool imguiCapture) {
     totalTime += deltaTime;
-    pushConstants.time = totalTime;
-    pushConstants.renderMode = renderMode;
-    pushConstants.showGround = showGround ? 1 : 0;
-    pushConstants.showGrid = showGrid ? 1 : 0;
-    pushConstants.brushX = brushX;
-    pushConstants.brushY = brushY;
-    pushConstants.brushZ = brushZ;
-    pushConstants.brushRadius = brushRadius;
 
-    // Camera control: only when right-click is held and ImGui doesn't capture
     if (input.mouseCaptured && !imguiCapture) {
-        // Mouse look
-        float sensitivity = 0.003f;
+        const float sensitivity = 0.003f;
         camYaw -= static_cast<float>(input.mouseDeltaX) * sensitivity;
         camPitch -= static_cast<float>(input.mouseDeltaY) * sensitivity;
-        
-        // Clamp pitch
-        if (camPitch > 1.5f) camPitch = 1.5f;
-        if (camPitch < -1.5f) camPitch = -1.5f;
+        camPitch = std::clamp(camPitch, -1.5f, 1.5f);
     }
 
-    // Scroll to change speed
     if (!imguiCapture) {
-        camSpeed += static_cast<float>(input.scrollDelta) * 0.5f;
-        if (camSpeed < 0.5f) camSpeed = 0.5f;
-        if (camSpeed > 50.0f) camSpeed = 50.0f;
+        camSpeed = std::clamp(camSpeed + static_cast<float>(input.scrollDelta) * 0.5f, 0.5f, 50.0f);
     }
 
-    // Camera direction from yaw/pitch
-    float dirX = cosf(camPitch) * sinf(camYaw);
-    float dirY = sinf(camPitch);
-    float dirZ = cosf(camPitch) * cosf(camYaw);
+    camDir = glm::vec3(std::cos(camPitch) * std::sin(camYaw), std::sin(camPitch), std::cos(camPitch) * std::cos(camYaw));
 
-    // WASD movement (only when right-click held)
     if (input.mouseCaptured && !imguiCapture) {
         float speed = camSpeed * deltaTime;
-        
-        // Forward/back
-        if (input.isKeyDown(GLFW_KEY_W)) {
-            camPosX += dirX * speed;
-            camPosY += dirY * speed;
-            camPosZ += dirZ * speed;
-        }
-        if (input.isKeyDown(GLFW_KEY_S)) {
-            camPosX -= dirX * speed;
-            camPosY -= dirY * speed;
-            camPosZ -= dirZ * speed;
-        }
-        
-        // Strafe (right vector = cross(dir, up) -> (-dirZ, 0, dirX))
-        float rightX = -dirZ;
-        float rightZ = dirX;
-        float rLen = sqrtf(rightX * rightX + rightZ * rightZ);
-        if (rLen > 0.0001f) { rightX /= rLen; rightZ /= rLen; }
-        
-        if (input.isKeyDown(GLFW_KEY_D)) {
-            camPosX += rightX * speed;
-            camPosZ += rightZ * speed;
-        }
-        if (input.isKeyDown(GLFW_KEY_A)) {
-            camPosX -= rightX * speed;
-            camPosZ -= rightZ * speed;
-        }
-        
-        // Up/down
-        if (input.isKeyDown(GLFW_KEY_E) || input.isKeyDown(GLFW_KEY_SPACE)) {
-            camPosY += speed;
-        }
-        if (input.isKeyDown(GLFW_KEY_Q) || input.isKeyDown(GLFW_KEY_LEFT_CONTROL)) {
-            camPosY -= speed;
-        }
-    }
-
-    pushConstants.camPosX = camPosX;
-    pushConstants.camPosY = camPosY;
-    pushConstants.camPosZ = camPosZ;
-    pushConstants.camDirX = dirX;
-    pushConstants.camDirY = dirY;
-    pushConstants.camDirZ = dirZ;
-    pushConstants.editCount = static_cast<float>(edits.size());
-
-    // Reset picking if not explicitly requested this frame
-    if (!pickingRequested) {
-        pushConstants.mouseX = -1.0f;
-        pushConstants.mouseY = -1.0f;
-    }
-
-    // Upload edits if changed
-    if (editsDirty) {
-        updateEditBuffer();
-        editsDirty = false;
+        // Matches the raymarcher's screen-right vector: cross(forward, up).
+        glm::vec3 right = glm::normalize(glm::vec3(-camDir.z, 0.0f, camDir.x) + glm::vec3(1e-6f, 0, 0));
+        if (input.isKeyDown(GLFW_KEY_W)) camPos += camDir * speed;
+        if (input.isKeyDown(GLFW_KEY_S)) camPos -= camDir * speed;
+        if (input.isKeyDown(GLFW_KEY_D)) camPos += right * speed;
+        if (input.isKeyDown(GLFW_KEY_A)) camPos -= right * speed;
+        if (input.isKeyDown(GLFW_KEY_E) || input.isKeyDown(GLFW_KEY_SPACE)) camPos.y += speed;
+        if (input.isKeyDown(GLFW_KEY_Q) || input.isKeyDown(GLFW_KEY_LEFT_CONTROL)) camPos.y -= speed;
     }
 }
 
-void SDFRenderer::render(vk::CommandBuffer commandBuffer) {
-    if (terrain) {
-        terrain->executePending(commandBuffer);
+// Copies the editor's edits into this frame's buffer (sanitized) and marks the volume
+// dirty wherever they differ from what is currently baked.
+uint32_t SDFRenderer::uploadEdits(uint32_t frame) {
+    const size_t count = std::min<size_t>(edits.size(), MAX_EDITS);
+    const glm::vec3 vMin = volume->worldMin(), vMax = volume->worldMax();
+
+    std::vector<core::SDFEdit> gpu(edits.begin(), edits.begin() + count);
+    for (auto& e : gpu) {
+        float len = glm::length(e.rotation);
+        e.rotation = len > 1e-6f ? e.rotation / len : glm::vec4(0, 0, 0, 1);
+        e.scale = glm::max(e.scale, glm::vec3(0.01f));
+        e.position = glm::clamp(e.position, vMin, vMax); // geometry is clipped to the volume
+        e.blendFactor = std::max(e.blendFactor, 0.0f);
+        if (e.primitiveType > 4) e.primitiveType = 0;
+        if (e.operation > 4) e.operation = 0;
     }
 
-    vk::ImageMemoryBarrier barrier{};
-    barrier.oldLayout = vk::ImageLayout::eUndefined;
-    barrier.newLayout = vk::ImageLayout::eGeneral;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = outputImage.image.get();
-    barrier.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = 1;
-    barrier.srcAccessMask = vk::AccessFlagBits::eNone;
-    barrier.dstAccessMask = vk::AccessFlagBits::eShaderWrite;
-
-    commandBuffer.pipelineBarrier(
-        vk::PipelineStageFlagBits::eTopOfPipe,
-        vk::PipelineStageFlagBits::eComputeShader,
-        {}, nullptr, nullptr, barrier
-    );
-
-    commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, computePipeline->getPipeline());
-    commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, computePipeline->getLayout(), 0, 1, &descriptorSet, 0, nullptr);
-    
-    commandBuffer.pushConstants(
-        computePipeline->getLayout(),
-        vk::ShaderStageFlagBits::eCompute,
-        0, sizeof(PushConstants), &pushConstants
-    );
-
-    uint32_t groupX = (outputWidth + 7) / 8;
-    uint32_t groupY = (outputHeight + 7) / 8;
-    commandBuffer.dispatch(groupX, groupY, 1);
-
-    // After dispatch, if we were picking, we need a barrier to ensure write is visible to host
-    if (pickingRequested) {
-        vk::BufferMemoryBarrier pickingBarrier{};
-        pickingBarrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
-        pickingBarrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
-        pickingBarrier.buffer = selectionBuffer.buffer.get();
-        pickingBarrier.offset = 0;
-        pickingBarrier.size = sizeof(SelectionData);
-
-        commandBuffer.pipelineBarrier(
-            vk::PipelineStageFlagBits::eComputeShader,
-            vk::PipelineStageFlagBits::eHost,
-            {}, nullptr, pickingBarrier, nullptr
-        );
-        pickingRequested = false; 
-    }
-
-    barrier.oldLayout = vk::ImageLayout::eGeneral;
-    barrier.newLayout = vk::ImageLayout::eTransferSrcOptimal;
-    barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
-    barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
-
-    commandBuffer.pipelineBarrier(
-        vk::PipelineStageFlagBits::eComputeShader,
-        vk::PipelineStageFlagBits::eTransfer,
-        {}, nullptr, nullptr, barrier
-    );
-}
-
-void SDFRenderer::updateEditBuffer() {
-    if (edits.empty()) return;
-
-    size_t uploadSize = sizeof(core::SDFEdit) * edits.size();
-    if (uploadSize > sizeof(core::SDFEdit) * 256) {
-        uploadSize = sizeof(core::SDFEdit) * 256;
-    }
-
-    void* data = context.getDevice().mapMemory(
-        editBuffer.memory.get(), 0, uploadSize
-    );
-    std::memcpy(data, edits.data(), uploadSize);
-    context.getDevice().unmapMemory(editBuffer.memory.get());
-}
-
-void SDFRenderer::createDescriptorSets() {
-    vk::DescriptorImageInfo atlasInfo{};
-    atlasInfo.imageView = context.getBrickAtlas().getAtlasView();
-    atlasInfo.imageLayout = vk::ImageLayout::eGeneral;
-
-    vk::DescriptorImageInfo mapInfo{};
-    mapInfo.imageView = context.getSparseMap().getMapView();
-    mapInfo.imageLayout = vk::ImageLayout::eGeneral;
-
-    vk::DescriptorImageInfo outInfo{};
-    outInfo.imageView = outputImage.view.get();
-    outInfo.imageLayout = vk::ImageLayout::eGeneral;
-
-    vk::DescriptorBufferInfo editBufInfo{};
-    editBufInfo.buffer = editBuffer.buffer.get();
-    editBufInfo.offset = 0;
-    editBufInfo.range = sizeof(core::SDFEdit) * 256;
-
-    vk::DescriptorBufferInfo selectBufInfo{};
-    selectBufInfo.buffer = selectionBuffer.buffer.get();
-    selectBufInfo.offset = 0;
-    selectBufInfo.range = sizeof(SelectionData);
-
-    vk::DescriptorImageInfo diffInfo{};
-    diffInfo.imageLayout = vk::ImageLayout::eGeneral; // Using General as it's also storage
-    diffInfo.imageView = terrain->getHeightmap().view.get();
-    diffInfo.sampler = terrainSampler;
-
-    vk::DescriptorImageInfo splatInfo{};
-    splatInfo.imageLayout = vk::ImageLayout::eGeneral;
-    splatInfo.imageView = terrain->getSplatmap().view.get();
-    splatInfo.sampler = terrainSampler;
-
-    std::vector<vk::WriteDescriptorSet> writes = {
-        { descriptorSet, 0, 0, 1, vk::DescriptorType::eStorageImage, &atlasInfo, nullptr, nullptr },
-        { descriptorSet, 1, 0, 1, vk::DescriptorType::eStorageImage, &mapInfo, nullptr, nullptr },
-        { descriptorSet, 2, 0, 1, vk::DescriptorType::eStorageImage, &outInfo, nullptr, nullptr },
-        { descriptorSet, 3, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &editBufInfo, nullptr },
-        { descriptorSet, 4, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &selectBufInfo, nullptr },
-        { descriptorSet, 5, 0, 1, vk::DescriptorType::eCombinedImageSampler, &diffInfo, nullptr, nullptr },
-        { descriptorSet, 6, 0, 1, vk::DescriptorType::eCombinedImageSampler, &splatInfo, nullptr, nullptr }
+    auto touch = [&](const core::SDFEdit& e) {
+        if (e.operation == static_cast<uint32_t>(core::SDFOp::Intersection)) {
+            volume->markAllDirty(); // intersection clips the whole field
+            return;
+        }
+        float r = core::editBoundRadius(e) + e.blendFactor;
+        volume->markDirty(e.position - glm::vec3(r), e.position + glm::vec3(r));
     };
 
-    descriptorManager->updateSet(descriptorSet, writes);
+    const size_t maxCount = std::max(gpu.size(), bakedEdits.size());
+    for (size_t i = 0; i < maxCount; ++i) {
+        const core::SDFEdit* now = i < gpu.size() ? &gpu[i] : nullptr;
+        const core::SDFEdit* was = i < bakedEdits.size() ? &bakedEdits[i] : nullptr;
+        if (now && was && std::memcmp(now, was, sizeof(core::SDFEdit)) == 0) continue;
+        if (now) touch(*now);
+        if (was) touch(*was);
+    }
+    bakedEdits = gpu;
+
+    if (count > 0) std::memcpy(editMapped[frame], gpu.data(), sizeof(core::SDFEdit) * count);
+    return static_cast<uint32_t>(count);
 }
 
-void SDFRenderer::triggerPicking(float x, float y) {
-    pushConstants.mouseX = x;
-    pushConstants.mouseY = y;
-    pickingRequested = true;
-}
+void SDFRenderer::render(vk::CommandBuffer cmd, uint32_t frame) {
+    uint32_t editCount = uploadEdits(frame);
 
-SDFRenderer::SelectionData SDFRenderer::getSelection() {
-    SelectionData result{-1, 0, 0, 0};
-    void* data = context.getDevice().mapMemory(selectionBuffer.memory.get(), 0, sizeof(SelectionData));
-    std::memcpy(&result, data, sizeof(SelectionData));
-    context.getDevice().unmapMemory(selectionBuffer.memory.get());
+    terrain->executePending(cmd);
+    volume->record(cmd, frame, editCount);
 
-    // Reset it to -1 for next pick
-    SelectionData clearVal{-1, 0, 0, 0};
-    void* clearPtr = context.getDevice().mapMemory(selectionBuffer.memory.get(), 0, sizeof(SelectionData));
-    std::memcpy(clearPtr, &clearVal, sizeof(SelectionData));
-    context.getDevice().unmapMemory(selectionBuffer.memory.get());
+    vk::ImageMemoryBarrier toGeneral{};
+    toGeneral.oldLayout = vk::ImageLayout::eUndefined;
+    toGeneral.newLayout = vk::ImageLayout::eGeneral;
+    toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toGeneral.image = outputImage.image.get();
+    toGeneral.subresourceRange = kColorRange;
+    toGeneral.srcAccessMask = vk::AccessFlagBits::eTransferRead; // previous frame's blit
+    toGeneral.dstAccessMask = vk::AccessFlagBits::eShaderWrite;
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eComputeShader,
+                        {}, nullptr, nullptr, toGeneral);
 
-    return result;
+    RayPushConstants pc{};
+    pc.camPos = glm::vec4(camPos, totalTime);
+    pc.camDir = glm::vec4(camDir, 0.0f);
+    pc.brush = glm::vec4(brushPos, brushRadius);
+    pc.mouse = glm::vec4(mouseX, mouseY, static_cast<float>(editCount), 0.0f);
+    pc.flags = glm::uvec4(renderMode, showGround ? 1u : 0u, showGrid ? 1u : 0u, 0u);
+    pc.size = glm::uvec4(outputWidth, outputHeight, 0u, 0u);
+
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->getPipeline());
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline->getLayout(), 0, sets[frame], nullptr);
+    cmd.pushConstants(pipeline->getLayout(), vk::ShaderStageFlagBits::eCompute, 0, sizeof(pc), &pc);
+    cmd.dispatch((outputWidth + 7) / 8, (outputHeight + 7) / 8, 1);
+
+    if (clickRequested) {
+        clickInFlight[frame] = true;
+        clickRequested = false;
+    }
+
+    // Selection result -> host (read after this slot's fence); output -> blit.
+    vk::MemoryBarrier toHost{ vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eHostRead };
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eHost,
+                        {}, toHost, nullptr, nullptr);
+
+    vk::ImageMemoryBarrier toSrc = toGeneral;
+    toSrc.oldLayout = vk::ImageLayout::eGeneral;
+    toSrc.newLayout = vk::ImageLayout::eTransferSrcOptimal;
+    toSrc.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+    toSrc.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eTransfer,
+                        {}, nullptr, nullptr, toSrc);
 }
 
 } // namespace engine::renderer

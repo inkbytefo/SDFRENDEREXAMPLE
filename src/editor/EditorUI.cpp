@@ -1,31 +1,34 @@
 #include "EditorUI.hpp"
 #include "renderer/SDFRenderer.hpp"
 #include "core/SDFEdit.hpp"
+#include "core/SceneGen.hpp"
 #include "renderer/Terrain.hpp"
 
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
 #include <iostream>
+#include <algorithm>
 #include <cmath>
+#include <glm/gtc/quaternion.hpp>
 
 namespace engine::editor {
 
 // Primitive type names for UI
 static const char* primitiveNames[] = { "Sphere", "Box", "Torus", "Capsule", "Cylinder" };
 static const char* operationNames[] = { "Union", "Subtraction", "Intersection", "SmoothUnion", "SmoothSub" };
-static const char* renderModeNames[] = { "Lit (Standard PBR)", "Normals", "Complexity (Steps)" };
+static const char* renderModeNames[] = { "Lit (Standard PBR)", "Normals", "Complexity (Steps)", "Bricks" };
 static const char* brushModeNames[] = { "Raise", "Lower", "Flatten", "Smooth", "Paint" };
-static const char* layerNames[] = { "Grass (Base)", "Dirt (R)", "Rock (G)", "Snow (B)" };
+static const char* layerNames[] = { "Grass", "Dirt", "Rock", "Snow" };
 
-// Terrain State
-static float brushRadius = 0.1f;
+// Terrain tool state
+static float brushRadius = 8.0f; // meters
 static float brushStrength = 0.5f;
 static int brushMode = 0;
-static int paintLayer = 1; // Default to 'Dirt'
+static int paintLayer = 1;
 static float targetHeight = 0.0f;
 static bool terrainToolsActive = false;
-static bool showGrid = false;
+static bool terrainEditing = false;
 
 EditorUI::EditorUI(engine::core::VulkanContext& ctx, GLFWwindow* window) : context(ctx) {
     initImGui(window);
@@ -125,7 +128,8 @@ void EditorUI::initImGui(GLFWwindow* window) {
     };
 
     // For dynamic rendering, set the color attachment format
-    VkFormat colorFormat = static_cast<VkFormat>(context.getSwapchain()->getFormat());
+    // Kept as a member: the backend holds on to this pointer.
+    colorFormat = static_cast<VkFormat>(context.getSwapchain()->getFormat());
     initInfo.PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     initInfo.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
     initInfo.PipelineRenderingCreateInfo.pColorAttachmentFormats = &colorFormat;
@@ -154,6 +158,14 @@ void EditorUI::initImGui(GLFWwindow* window) {
     std::cout << "ImGui initialized with Vulkan dynamic rendering." << std::endl;
 }
 
+void EditorUI::onSwapchainRecreated() {
+    ImGui_ImplVulkan_SetMinImageCount(static_cast<uint32_t>(context.getSwapchain()->getImages().size()));
+}
+
+bool EditorUI::isPaintingTerrain() const {
+    return terrainEditing;
+}
+
 void EditorUI::shutdownImGui() {
     context.getDevice().waitIdle();
     ImGui_ImplVulkan_Shutdown();
@@ -168,60 +180,44 @@ void EditorUI::beginFrame() {
 }
 
 void EditorUI::buildPanels(engine::renderer::SDFRenderer& renderer, int& selectedIndex) {
+    using engine::renderer::SDFRenderer;
     auto& edits = renderer.getEdits();
+    auto& volume = renderer.getVolume();
+    const glm::vec3 vMin = volume.worldMin(), vMax = volume.worldMax();
 
     // --- Scene Hierarchy ---
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(280, 320), ImGuiCond_FirstUseEver);
     ImGui::Begin("Scene Objects", nullptr, ImGuiWindowFlags_NoCollapse);
 
-    // Add button
-    if (ImGui::Button("+ Add Object", ImVec2(-1, 30))) {
+    const bool full = edits.size() >= SDFRenderer::MAX_EDITS;
+    ImGui::BeginDisabled(full);
+    if (ImGui::Button(full ? "Edit limit reached (256)" : "+ Add Object", ImVec2(-1, 30))) {
         engine::core::SDFEdit newEdit{};
         newEdit.position = glm::vec3(0.0f, 1.0f, 5.0f);
-        newEdit.rotation = glm::vec4(0, 0, 0, 1);
-        newEdit.scale = glm::vec3(1.0f);
-        newEdit.primitiveType = 0; // Sphere
-        newEdit.operation = 0; // Union
-        newEdit.blendFactor = 0.3f;
-        newEdit.isDynamic = 0;
         newEdit.material.albedo = glm::vec3(0.8f, 0.3f, 0.2f);
-        newEdit.material.roughness = 0.5f;
-        newEdit.material.metallic = 0.0f;
         edits.push_back(newEdit);
         selectedIndex = static_cast<int>(edits.size()) - 1;
-        renderer.markEditsDirty();
     }
+    ImGui::EndDisabled();
 
     ImGui::Separator();
 
-    // Object list
     for (int i = 0; i < static_cast<int>(edits.size()); i++) {
-        int primType = static_cast<int>(edits[i].primitiveType);
-        if (primType < 0 || primType > 4) primType = 0;
-        
+        int primType = std::clamp(static_cast<int>(edits[i].primitiveType), 0, 4);
+        int op = std::clamp(static_cast<int>(edits[i].operation), 0, 4);
         char label[64];
-        snprintf(label, sizeof(label), "%s %s #%d", 
-                 primitiveNames[primType],
-                 operationNames[edits[i].operation],
-                 i);
-
-        bool selected = (selectedIndex == i);
-        if (ImGui::Selectable(label, selected)) {
-            selectedIndex = i;
-        }
+        snprintf(label, sizeof(label), "%s %s #%d", primitiveNames[primType], operationNames[op], i);
+        if (ImGui::Selectable(label, selectedIndex == i)) selectedIndex = i;
     }
 
-    // Delete button
     if (selectedIndex >= 0 && selectedIndex < static_cast<int>(edits.size())) {
         ImGui::Separator();
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.15f, 0.15f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.2f, 0.2f, 1.0f));
         if (ImGui::Button("Delete Selected", ImVec2(-1, 28))) {
             edits.erase(edits.begin() + selectedIndex);
-            if (selectedIndex >= static_cast<int>(edits.size()))
-                selectedIndex = static_cast<int>(edits.size()) - 1;
-            renderer.markEditsDirty();
+            selectedIndex = std::min(selectedIndex, static_cast<int>(edits.size()) - 1);
         }
         ImGui::PopStyleColor(2);
     }
@@ -230,178 +226,122 @@ void EditorUI::buildPanels(engine::renderer::SDFRenderer& renderer, int& selecte
 
     // --- Inspector ---
     ImGui::SetNextWindowPos(ImVec2(10, 340), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(280, 380), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(280, 400), ImGuiCond_FirstUseEver);
     ImGui::Begin("Inspector", nullptr, ImGuiWindowFlags_NoCollapse);
 
     if (selectedIndex >= 0 && selectedIndex < static_cast<int>(edits.size())) {
         auto& edit = edits[selectedIndex];
 
-        // Primitive Type
         int primType = static_cast<int>(edit.primitiveType);
         if (ImGui::Combo("Primitive", &primType, primitiveNames, IM_ARRAYSIZE(primitiveNames))) {
             edit.primitiveType = static_cast<uint32_t>(primType);
-            renderer.markEditsDirty();
         }
-
-        // Operation
         int op = static_cast<int>(edit.operation);
         if (ImGui::Combo("Operation", &op, operationNames, IM_ARRAYSIZE(operationNames))) {
             edit.operation = static_cast<uint32_t>(op);
-            renderer.markEditsDirty();
         }
 
         ImGui::Separator();
         ImGui::Text("Transform");
 
-        // Position
-        if (ImGui::DragFloat3("Position", &edit.position.x, 0.05f, -50.0f, 50.0f, "%.2f")) {
-            renderer.markEditsDirty();
+        ImGui::DragFloat3("Position", &edit.position.x, 0.05f, 0.0f, 0.0f, "%.2f");
+        edit.position = glm::clamp(edit.position, vMin, vMax);
+
+        // Rotation is edited as Euler degrees (kept alongside the edit, ignored by the GPU)
+        // and converted to the quaternion the shaders use.
+        if (ImGui::DragFloat3("Rotation", &edit.material.editorEulerDeg.x, 0.5f, -360.0f, 360.0f, "%.1f deg")) {
+            glm::quat q(glm::radians(edit.material.editorEulerDeg));
+            edit.rotation = glm::vec4(q.x, q.y, q.z, q.w);
         }
 
-        // Scale
-        if (ImGui::DragFloat3("Scale", &edit.scale.x, 0.02f, 0.05f, 20.0f, "%.2f")) {
-            renderer.markEditsDirty();
-        }
-
-        // Blend factor
-        if (ImGui::SliderFloat("Blend", &edit.blendFactor, 0.0f, 2.0f, "%.2f")) {
-            renderer.markEditsDirty();
-        }
+        ImGui::DragFloat3("Scale", &edit.scale.x, 0.02f, 0.05f, 20.0f, "%.2f");
+        ImGui::SliderFloat("Blend", &edit.blendFactor, 0.0f, 2.0f, "%.2f");
 
         ImGui::Separator();
         ImGui::Text("Material");
-
-        // Color
-        if (ImGui::ColorEdit3("Albedo", &edit.material.albedo.x)) {
-            renderer.markEditsDirty();
-        }
-        if (ImGui::SliderFloat("Roughness", &edit.material.roughness, 0.01f, 1.0f, "%.2f")) {
-            renderer.markEditsDirty();
-        }
-        if (ImGui::SliderFloat("Metallic", &edit.material.metallic, 0.0f, 1.0f, "%.2f")) {
-            renderer.markEditsDirty();
-        }
+        ImGui::ColorEdit3("Albedo", &edit.material.albedo.x);
+        ImGui::SliderFloat("Roughness", &edit.material.roughness, 0.01f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Metallic", &edit.material.metallic, 0.0f, 1.0f, "%.2f");
     } else {
-        ImGui::TextWrapped("Select an object or add a new one.");
+        ImGui::TextWrapped("Select an object (or click it in the viewport), or add a new one.");
     }
 
     ImGui::End();
 
     // --- Display Settings ---
     ImGui::SetNextWindowPos(ImVec2(300, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(280, 140), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(300, 250), ImGuiCond_FirstUseEver);
     ImGui::Begin("Display Settings", nullptr, ImGuiWindowFlags_NoCollapse);
-    
+
     int renderMode = static_cast<int>(renderer.getRenderMode());
     if (ImGui::Combo("Render Mode", &renderMode, renderModeNames, IM_ARRAYSIZE(renderModeNames))) {
         renderer.getRenderMode() = static_cast<uint32_t>(renderMode);
     }
-    
-    bool showGround = renderer.getShowGround();
-    if (ImGui::Checkbox("Show Ground Plane", &showGround)) {
-        renderer.getShowGround() = showGround;
-    }
+    ImGui::Checkbox("Show Ground", &renderer.getShowGround());
+    ImGui::Checkbox("Show Grid", &renderer.getShowGrid());
 
     ImGui::Separator();
+    const auto& st = volume.getStats();
     ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
-    ImGui::Text("Objects: %d", (int)edits.size());
+    ImGui::Text("Objects: %d / %u", static_cast<int>(edits.size()), SDFRenderer::MAX_EDITS);
+    ImGui::Text("Bricks: %u / %u (%.1f%%)", st.used, st.capacity, 100.0f * st.used / std::max(1u, st.capacity));
+    ImGui::Text("Last bake: %u cells", st.lastDirtyCells);
+    if (st.overflow > 0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Atlas full: %u surface cells dropped", st.overflow);
+    }
+    ImGui::TextDisabled("Volume: (%.0f,%.0f,%.0f) - (%.0f,%.0f,%.0f)", vMin.x, vMin.y, vMin.z, vMax.x, vMax.y, vMax.z);
+
+    // Profiling helper: scatter random primitives around the origin.
+    if (ImGui::Button("Stress: +32 random objects") && !full) {
+        static uint32_t seed = 1234567u;
+        size_t room = SDFRenderer::MAX_EDITS - edits.size();
+        for (auto& e : engine::core::makeRandomEdits(std::min<size_t>(32, room), seed)) edits.push_back(e);
+    }
 
     ImGui::End();
 
     // --- Terrain Tools ---
-    ImGui::SetNextWindowPos(ImVec2(300, 160), ImGuiCond_FirstUseEver); // Adjust pos
-    ImGui::SetNextWindowSize(ImVec2(280, 240), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(300, 270), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(300, 220), ImGuiCond_FirstUseEver);
     ImGui::Begin("Terrain Tools", nullptr, ImGuiWindowFlags_NoCollapse);
-    
+
     ImGui::Checkbox("Enable Editing", &terrainToolsActive);
-    
+    terrainEditing = false;
+
     if (terrainToolsActive) {
         ImGui::Combo("Mode", &brushMode, brushModeNames, IM_ARRAYSIZE(brushModeNames));
-        
-        if (brushMode == 4) { // Paint
-            ImGui::Combo("Layer", &paintLayer, layerNames, IM_ARRAYSIZE(layerNames));
-        }
-
-        ImGui::SliderFloat("Radius", &brushRadius, 0.01f, 0.5f);
+        if (brushMode == 4) ImGui::Combo("Layer", &paintLayer, layerNames, IM_ARRAYSIZE(layerNames));
+        ImGui::SliderFloat("Radius (m)", &brushRadius, 0.5f, 64.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
         ImGui::SliderFloat("Strength", &brushStrength, 0.01f, 5.0f);
-        
-        if (brushMode == 2) { // Flatten
-             ImGui::DragFloat("Target Height", &targetHeight, 0.1f, -50.0f, 50.0f);
-        }
+        if (brushMode == 2) ImGui::DragFloat("Target Height", &targetHeight, 0.1f, -50.0f, 50.0f);
 
-        ImGui::Separator();
-        ImGui::Text("Debug View");
-        if (ImGui::Checkbox("Show Grid", &showGrid)) {
-            renderer.getShowGrid() = showGrid;
-        }
-
-        // Logic for applying brush
-        if (!ImGui::GetIO().WantCaptureMouse) {
-            // Trigger picking request for NEXT frame
-            ImVec2 mousePos = ImGui::GetIO().MousePos;
-            renderer.triggerPicking(mousePos.x, mousePos.y);
-
-            // Check result from LAST frame
-            auto selection = renderer.getSelection();
-            
-            // Update brush cursor visual in renderer
-            float visualRadius = (brushMode == 100) ? 0.0f : brushRadius; // Always show unless hidden
-            if (selection.hitIndex == 0) {
-                renderer.setBrush(selection.posX, selection.posY, selection.posZ, visualRadius);
-            } else {
-                renderer.setBrush(0, -1000, 0, 0); // Hide if not on ground
-            }
-            
-            // If we hit the ground (index 0) and mouse is down
-            bool mouseDown = ImGui::IsMouseDown(ImGuiMouseButton_Left);
-            if (selection.hitIndex == 0) {
-                 // Show cursor info
-                 ImGui::Text("Target: %.2f %.2f %.2f", selection.posX, selection.posY, selection.posZ);
-                 
-                 if (mouseDown) {
-                     engine::renderer::Terrain::BrushParams params{};
-                     // Map World Pos to UV
-                     // World is centered at 0, size 256. UV 0 at -128, UV 1 at 128.
-                     params.pos.x = (selection.posX + 128.0f) / 256.0f;
-                     params.pos.y = (selection.posZ + 128.0f) / 256.0f;
-                     params.radius = brushRadius; // In UV space? Or world? 
-                     // Shader uses distance(uv, pc.pos) which is UV distance.
-                     // So we need to convert world radius to UV radius.
-                     // 256 world units = 1.0 UV units.
-                     params.radius = brushRadius / 256.0f * 10.0f; // Scale factor? Editor radius usage is arbitrary. 
-                     // Let's say brushRadius is in World Units (approx).
-                     // Then UV radius = brushRadius / 256.0f.
-                     // But brushRadius 0.1 is very small for 256 map. 
-                     // Let's treat UI brushRadius as UV fraction for now? 
-                     // Or just scale it. Let's say UI radius 0.0-0.5 is adequate for UV.
-                     params.radius = brushRadius; 
-
-                     params.strength = brushStrength * 0.01f; // Scale down for valid step
-                     params.mode = static_cast<uint32_t>(brushMode);
-                     params.layer = static_cast<uint32_t>(paintLayer);
-                     params.targetHeight = targetHeight;
-                     
-                     renderer.getTerrain().queueBrush(params);
-                 }
-            } else {
-                ImGui::Text("Hover: None/Sky");
+        const auto& hover = renderer.getHover();
+        const bool overUI = ImGui::GetIO().WantCaptureMouse;
+        if (!overUI && hover.hitIndex == 0) {
+            renderer.setBrush(hover.position(), brushRadius);
+            ImGui::Text("Target: %.2f %.2f %.2f", hover.posX, hover.posY, hover.posZ);
+            if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                renderer.getTerrain().queueBrush(
+                    hover.position(), brushRadius, brushStrength * 0.01f,
+                    static_cast<engine::renderer::Terrain::BrushMode>(brushMode),
+                    static_cast<uint32_t>(paintLayer), targetHeight);
+                terrainEditing = true;
             }
         } else {
-             renderer.triggerPicking(-1, -1); // Cancel picking if UI interaction
-             renderer.setBrush(0, -1000, 0, 0);
+            renderer.setBrush(glm::vec3(0.0f), 0.0f);
+            ImGui::TextDisabled("Hover the terrain to paint");
         }
     } else {
-        renderer.setBrush(0, -1000, 0, 0);
-        renderer.getShowGrid() = false; // Optional: auto-hide grid when tool closed
+        renderer.setBrush(glm::vec3(0.0f), 0.0f);
     }
 
     ImGui::End();
 
-    // --- Controls / Info ---
-    ImGui::SetNextWindowPos(ImVec2(300, 410), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(280, 80), ImGuiCond_FirstUseEver);
+    // --- Controls ---
+    ImGui::SetNextWindowPos(ImVec2(300, 500), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(300, 90), ImGuiCond_FirstUseEver);
     ImGui::Begin("Controls", nullptr, ImGuiWindowFlags_NoCollapse);
-    ImGui::TextWrapped("RMB + WASD: Fly camera\nScroll: Speed");
+    ImGui::TextWrapped("RMB + WASD/QE: fly camera\nScroll: speed\nLMB: select object");
     ImGui::End();
 }
 

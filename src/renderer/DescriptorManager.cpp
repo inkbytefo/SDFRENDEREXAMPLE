@@ -4,12 +4,14 @@ namespace engine::renderer {
 
 DescriptorManager::DescriptorManager(vk::Device device) : device(device) {
     std::vector<vk::DescriptorPoolSize> poolSizes = {
-        { vk::DescriptorType::eStorageImage, 10 },
-        { vk::DescriptorType::eStorageBuffer, 10 }
+        { vk::DescriptorType::eStorageImage, 32 },
+        { vk::DescriptorType::eStorageBuffer, 32 },
+        { vk::DescriptorType::eCombinedImageSampler, 32 },
+        { vk::DescriptorType::eUniformBuffer, 16 }
     };
 
     vk::DescriptorPoolCreateInfo poolInfo{};
-    poolInfo.maxSets = 10;
+    poolInfo.maxSets = 16;
     poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
 
