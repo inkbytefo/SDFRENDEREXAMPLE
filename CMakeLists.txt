@@ -30,6 +30,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glm)
 
+# Jolt enables AVX2/FMA/F16C/LZCNT by default, so binaries need a ~2013+ CPU.
+option(SDF_PORTABLE_CPU "Build Jolt with SSE4.2 only (runs on older CPUs)" OFF)
+if(SDF_PORTABLE_CPU)
+    foreach(JOLT_ISA USE_AVX USE_AVX2 USE_AVX512 USE_LZCNT USE_TZCNT USE_F16C USE_FMADD)
+        set(${JOLT_ISA} OFF CACHE BOOL "" FORCE)
+    endforeach()
+endif()
+
 FetchContent_Declare(
     jolt
     GIT_REPOSITORY https://github.com/jrouwe/JoltPhysics.git
@@ -71,24 +79,34 @@ find_package(Vulkan REQUIRED)
 
 target_link_libraries(imgui_lib PUBLIC Vulkan::Vulkan glfw)
 
-# Shader Compilation
+# Shader Compilation (compute shaders -> build/shaders/*.spv)
+find_program(GLSLC glslc HINTS $ENV{VULKAN_SDK}/Bin $ENV{VULKAN_SDK}/bin REQUIRED)
+
 set(SHADERS
     shaders/SDFCompute.glsl
+    shaders/BrickBake.glsl
     shaders/TerrainBrush.glsl
 )
+set(SHADER_INCLUDES
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/include/sdf_common.glsl
+)
+set(SHADER_OUT_DIR "${CMAKE_BINARY_DIR}/shaders")
 
 foreach(SHADER ${SHADERS})
     get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
-    set(SPIRV_FILE "${CMAKE_BINARY_DIR}/shaders/${SHADER_NAME}.spv")
+    set(SPIRV_FILE "${SHADER_OUT_DIR}/${SHADER_NAME}.spv")
     add_custom_command(
         OUTPUT ${SPIRV_FILE}
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shaders"
-        COMMAND glslc -fshader-stage=compute ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER} -o ${SPIRV_FILE}
-        DEPENDS ${SHADER}
-        COMMENT "Compiling ${SHADER} to ${SPIRV_FILE}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUT_DIR}"
+        COMMAND ${GLSLC} --target-env=vulkan1.3 -fshader-stage=compute -O
+                ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER} -o ${SPIRV_FILE}
+        DEPENDS ${SHADER} ${SHADER_INCLUDES}
+        COMMENT "Compiling ${SHADER}"
+        VERBATIM
     )
     list(APPEND SPIRV_SHADERS ${SPIRV_FILE})
 endforeach()
+add_custom_target(Shaders DEPENDS ${SPIRV_SHADERS})
 
 add_executable(Engine
     src/main.cpp
@@ -106,22 +124,26 @@ add_executable(Engine
     src/renderer/ResourceManager.hpp
     src/renderer/DescriptorManager.cpp
     src/renderer/DescriptorManager.hpp
-    src/renderer/BrickAtlas.cpp
-    src/renderer/BrickAtlas.hpp
-    src/renderer/SparseMap.cpp
-    src/renderer/SparseMap.hpp
+    src/renderer/BrickVolume.cpp
+    src/renderer/BrickVolume.hpp
     src/renderer/ComputePipeline.cpp
     src/renderer/ComputePipeline.hpp
     src/renderer/SDFRenderer.cpp
     src/renderer/SDFRenderer.hpp
     src/renderer/Terrain.cpp
+    src/renderer/Terrain.hpp
     src/editor/EditorUI.cpp
     src/editor/EditorUI.hpp
-    ${SPIRV_SHADERS}
 )
+add_dependencies(Engine Shaders)
 
 target_include_directories(Engine PRIVATE src ${CMAKE_BINARY_DIR}/_deps/jolt-src)
-target_compile_definitions(Engine PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1)
+target_compile_definitions(Engine PRIVATE
+    IMGUI_IMPL_VULKAN_NO_PROTOTYPES
+    VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
+    GLM_ENABLE_EXPERIMENTAL
+    SDF_SHADER_DIR="${SHADER_OUT_DIR}"
+)
 target_link_libraries(Engine PRIVATE Vulkan::Vulkan glfw glm::glm Jolt imgui_lib)
 
 if(MSVC)

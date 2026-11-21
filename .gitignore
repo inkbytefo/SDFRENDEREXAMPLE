@@ -1,5 +1,7 @@
 # Build artifacts
 build/
+build-*/
+build_log*.txt
 CMakeFiles/
 CMakeCache.txt
 *.cmake

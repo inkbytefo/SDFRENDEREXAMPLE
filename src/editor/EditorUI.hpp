@@ -21,10 +21,13 @@ public:
 
     bool wantsCaptureKeyboard() const;
     bool wantsCaptureMouse() const;
+    bool isPaintingTerrain() const;
+    void onSwapchainRecreated();
 
 private:
     engine::core::VulkanContext& context;
     vk::UniqueDescriptorPool imguiPool;
+    VkFormat colorFormat = VK_FORMAT_UNDEFINED;
 
     // Device-loaded Vulkan 1.3 dynamic rendering functions
     PFN_vkCmdBeginRendering pfnCmdBeginRendering = nullptr;

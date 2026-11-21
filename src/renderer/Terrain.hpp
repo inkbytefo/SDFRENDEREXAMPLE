@@ -2,43 +2,52 @@
 
 #include "core/VulkanContext.hpp"
 #include "ComputePipeline.hpp"
+#include <glm/glm.hpp>
 #include <memory>
 
 namespace engine::renderer {
 
 class DescriptorManager;
 
+// 2D heightfield terrain (256 x 256 m, centered on the origin) edited with a compute brush.
 class Terrain {
 public:
+    static constexpr float WORLD_SIZE = 256.0f;
+
+    enum class BrushMode : uint32_t { Raise = 0, Lower = 1, Flatten = 2, Smooth = 3, Paint = 4 };
+
+    // Must match the push constant block in TerrainBrush.glsl.
     struct BrushParams {
-        glm::vec2 pos; // UV coordinates (0-1)
-        float radius;  // UV radius
+        glm::vec2 pos;        // UV center
+        float radius;         // UV radius
         float strength;
-        uint32_t mode; // 0=Raise, 1=Lower, 2=Flatten, 3=Smooth, 4=Paint
-        uint32_t layer; // 0=Base, 1=R, 2=G, 3=B
-        float targetHeight; // For Flatten
-        float padding;
+        uint32_t mode;        // BrushMode
+        uint32_t layer;       // splat channel 0..3
+        float targetHeight;   // Flatten
+        float pad0 = 0.0f;
+        glm::ivec2 origin{0}; // filled in by Terrain
+        glm::ivec2 pad1{0};
     };
+    static_assert(sizeof(BrushParams) == 48, "BrushParams must match TerrainBrush.glsl");
 
     Terrain(core::VulkanContext& context, uint32_t size = 1024);
     ~Terrain();
 
-    void queueBrush(const BrushParams& params);
+    // Brush is applied in world units; converted to UV here.
+    void queueBrush(glm::vec3 worldPos, float worldRadius, float strength, BrushMode mode,
+                    uint32_t layer, float targetHeight);
     void executePending(vk::CommandBuffer cmd);
 
     ResourceManager::Image& getHeightmap() { return heightmap; }
     ResourceManager::Image& getSplatmap() { return splatmap; }
-    
-    // Material settings (could be a UBO, but for now simple getters/setters or just fixed)
-    // We'll hardcode materials in shader for now or pass as push constants if needed,
-    // but the SDF renderer already has material logic.
 
 private:
     core::VulkanContext& context;
     uint32_t size;
 
     ResourceManager::Image heightmap;
-    ResourceManager::Image splatmap; // RGBA8 (Base, Layer1, Layer2, Layer3 weights)
+    ResourceManager::Image heightScratch; // snapshot for the Smooth brush
+    ResourceManager::Image splatmap;      // RGBA8 layer weights
 
     std::unique_ptr<DescriptorManager> descriptorManager;
     vk::DescriptorSetLayout descriptorSetLayout;

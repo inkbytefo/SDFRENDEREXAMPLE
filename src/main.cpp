@@ -1,142 +1,151 @@
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include "core/Window.hpp"
 #include "core/VulkanContext.hpp"
 #include "core/PhysicsSystem.hpp"
 #include "renderer/SDFRenderer.hpp"
 #include "editor/EditorUI.hpp"
+#include "core/SceneGen.hpp"
 
-int main() {
+#include <imgui.h>
+
+using engine::core::SDFEdit;
+using engine::core::SDFOp;
+using engine::core::SDFPrimitive;
+
+static SDFEdit makeEdit(SDFPrimitive prim, glm::vec3 pos, glm::vec3 scale, glm::vec3 albedo,
+                        float roughness, float metallic) {
+    SDFEdit e{};
+    e.position = pos;
+    e.scale = scale;
+    e.primitiveType = static_cast<uint32_t>(prim);
+    e.operation = static_cast<uint32_t>(SDFOp::Union);
+    e.material.albedo = albedo;
+    e.material.roughness = roughness;
+    e.material.metallic = metallic;
+    return e;
+}
+
+// Usage: Engine [--bench [objectCount]] [--bench-res W H]
+//   --bench      adds objectCount random objects (default 96), renders 300 frames without
+//                input, prints the average frame time and exits.
+//   --bench-res  renders at a fixed internal resolution (upscaled to the window).
+int main(int argc, char** argv) {
+    int benchObjects = -1;
+    uint32_t benchW = 0, benchH = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--bench") == 0) {
+            benchObjects = (i + 1 < argc) ? std::atoi(argv[i + 1]) : 96;
+            if (benchObjects <= 0) benchObjects = 96;
+        } else if (std::strcmp(argv[i], "--bench-res") == 0 && i + 2 < argc) {
+            benchW = static_cast<uint32_t>(std::atoi(argv[i + 1]));
+            benchH = static_cast<uint32_t>(std::atoi(argv[i + 2]));
+        }
+    }
+
     try {
-        // 1. Window
-        engine::core::Window window(1280, 720, "SDF Playground - Vulkan 1.4 + Jolt");
-
-        // 2. Vulkan Context
+        engine::core::Window window(1280, 720, "SDF Playground - Vulkan + Jolt");
         engine::core::VulkanContext context(window);
-
-        // 3. Physics
         engine::core::PhysicsSystem physics;
-
-        // 4. SDF Renderer
         engine::renderer::SDFRenderer renderer(context);
- 
-        // 5. Editor UI (ImGui)
         engine::editor::EditorUI editor(context, window.getGLFWwindow());
 
-        // 6. Add default scene objects
-        {
-            auto& edits = renderer.getEdits();
-            
-            // Sphere
-            engine::core::SDFEdit sphere{};
-            sphere.position = glm::vec3(0.0f, 1.0f, 5.0f);
-            sphere.rotation = glm::vec4(0, 0, 0, 1);
-            sphere.scale = glm::vec3(1.0f);
-            sphere.primitiveType = 0;
-            sphere.operation = 0;
-            sphere.blendFactor = 0.3f;
-            sphere.material.albedo = glm::vec3(0.9f, 0.3f, 0.2f);
-            sphere.material.roughness = 0.3f;
-            sphere.material.metallic = 0.0f;
-            edits.push_back(sphere);
+        auto& edits = renderer.getEdits();
+        edits.push_back(makeEdit(SDFPrimitive::Sphere, { 0.0f, 1.0f, 5.0f }, glm::vec3(1.0f), { 0.9f, 0.3f, 0.2f }, 0.3f, 0.0f));
+        edits.push_back(makeEdit(SDFPrimitive::Box, { 3.0f, 0.8f, 5.0f }, glm::vec3(0.8f), { 0.3f, 0.7f, 0.9f }, 0.5f, 0.2f));
+        edits.push_back(makeEdit(SDFPrimitive::Torus, { -2.5f, 0.7f, 6.0f }, { 0.8f, 0.25f, 1.0f }, { 0.9f, 0.8f, 0.2f }, 0.3f, 0.8f));
 
-            // Box
-            engine::core::SDFEdit box{};
-            box.position = glm::vec3(3.0f, 0.8f, 5.0f);
-            box.rotation = glm::vec4(0, 0, 0, 1);
-            box.scale = glm::vec3(0.8f);
-            box.primitiveType = 1;
-            box.operation = 0;
-            box.blendFactor = 0.3f;
-            box.material.albedo = glm::vec3(0.3f, 0.7f, 0.9f);
-            box.material.roughness = 0.5f;
-            box.material.metallic = 0.2f;
-            edits.push_back(box);
-
-            // Torus
-            engine::core::SDFEdit torus{};
-            torus.position = glm::vec3(-2.5f, 0.7f, 6.0f);
-            torus.rotation = glm::vec4(0, 0, 0, 1);
-            torus.scale = glm::vec3(0.8f, 0.25f, 1.0f);
-            torus.primitiveType = 2;
-            torus.operation = 0;
-            torus.blendFactor = 0.3f;
-            torus.material.albedo = glm::vec3(0.9f, 0.8f, 0.2f);
-            torus.material.roughness = 0.3f;
-            torus.material.metallic = 0.8f;
-            edits.push_back(torus);
-
-            renderer.markEditsDirty();
+        if (benchObjects > 0) {
+            uint32_t seed = 1234567u;
+            for (auto& e : engine::core::makeRandomEdits(static_cast<size_t>(benchObjects), seed)) edits.push_back(e);
         }
+        if (benchW > 0 && benchH > 0) renderer.resize({ benchW, benchH });
+        int benchFrame = 0;
+        double benchStart = 0.0;
+        constexpr int kBenchWarmup = 30, kBenchFrames = 300;
 
-        std::cout << "Playground ready! RMB+WASD to fly, scroll for speed." << std::endl;
+        std::cout << "Playground ready! RMB+WASD to fly, scroll for speed, LMB to select." << std::endl;
 
-        // 7. Main Loop
         float lastFrameTime = static_cast<float>(glfwGetTime());
         int selectedEdit = 0;
-        bool pendingPick = false;
+        uint32_t swapchainGeneration = context.getSwapchainGeneration();
 
         while (!window.shouldClose()) {
             window.pollEvents();
 
-            if (pendingPick) {
-                int hit = renderer.getSelection().hitIndex;
-                if (hit > 0) { // 1+ are edits
-                    selectedEdit = hit - 1;
-                }
-                pendingPick = false;
+            float now = static_cast<float>(glfwGetTime());
+            float deltaTime = now - lastFrameTime;
+            lastFrameTime = now;
+
+            // Waits for this slot's fence; false means the swapchain was rebuilt.
+            bool frameReady = context.beginFrame();
+            if (context.getSwapchainGeneration() != swapchainGeneration) {
+                swapchainGeneration = context.getSwapchainGeneration();
+                renderer.resize(benchW > 0 && benchH > 0 ? vk::Extent2D{ benchW, benchH }
+                                                         : context.getSwapchain()->getExtent());
+                editor.onSwapchainRecreated();
+            }
+            if (!frameReady) continue;
+
+            const uint32_t frame = context.getCurrentFrame();
+            renderer.beginFrame(frame);
+
+            // Click-to-select results arrive a couple of frames after the click.
+            if (auto pick = renderer.takeClickResult(); pick && pick->hitIndex > 0) {
+                selectedEdit = pick->hitIndex - 1;
             }
 
-            float currentTime = static_cast<float>(glfwGetTime());
-            float deltaTime = currentTime - lastFrameTime;
-            lastFrameTime = currentTime;
-
-            // Check if ImGui wants input
-            bool imguiCapture = editor.wantsCaptureMouse();
-
-            // Update
-            physics.update(deltaTime);
-            renderer.update(deltaTime, window.getInput(), imguiCapture);
-
-            // Handle picking
-            if (window.getInput().mouseClicked[0] && !imguiCapture) {
-                renderer.triggerPicking(
-                    static_cast<float>(window.getInput().mouseX), 
-                    static_cast<float>(window.getInput().mouseY)
-                );
-                pendingPick = true;
-            }
-
-            // Begin frame
-            context.beginFrame();
-            auto cmd = context.getCurrentCommandBuffer();
-
-            // Compute SDF render
-            renderer.render(cmd);
-
-            // Blit compute result to swapchain
-            context.endFrameBlit(renderer.getOutputImage());
-
-            // ImGui overlay
             editor.beginFrame();
             editor.buildPanels(renderer, selectedEdit);
-            renderer.markEditsDirty(); // Always upload (edits may change via UI)
+            const bool imguiCapture = editor.wantsCaptureMouse();
 
-            auto swapExtent = context.getSwapchain()->getExtent();
-            auto imageViews = context.getSwapchain()->getImageViews();
-            vk::ImageView currentView = imageViews[context.getImageIndex()];
-            editor.endFrame(cmd, currentView, swapExtent);
+            // Hover picking runs every frame; window coords -> output pixels.
+            const auto& input = window.getInput();
+            ImVec2 fbScale = ImGui::GetIO().DisplayFramebufferScale;
+            if (!imguiCapture) {
+                renderer.setMousePixel(static_cast<float>(input.mouseX) * fbScale.x,
+                                       static_cast<float>(input.mouseY) * fbScale.y);
+            } else {
+                renderer.setMousePixel(-1.0f, -1.0f);
+            }
+            if (input.mouseClicked[0] && !imguiCapture && !editor.isPaintingTerrain()) {
+                renderer.requestClickPick();
+            }
 
-            // Present
+            physics.update(deltaTime);
+            renderer.update(deltaTime, input, imguiCapture);
+
+            auto cmd = context.getCurrentCommandBuffer();
+            renderer.render(cmd, frame);
+            context.endFrameBlit(renderer.getOutputImage(), renderer.getOutputExtent());
+
+            vk::ImageView swapView = context.getSwapchain()->getImageViews()[context.getImageIndex()];
+            editor.endFrame(cmd, swapView, context.getSwapchain()->getExtent());
+
             context.endFramePresent();
+
+            if (benchObjects > 0) {
+                ++benchFrame;
+                if (benchFrame == kBenchWarmup) {
+                    context.getDevice().waitIdle();
+                    benchStart = glfwGetTime();
+                } else if (benchFrame == kBenchWarmup + kBenchFrames) {
+                    context.getDevice().waitIdle();
+                    double ms = (glfwGetTime() - benchStart) * 1000.0 / kBenchFrames;
+                    auto ext = renderer.getOutputExtent();
+                    std::cout << "BENCH objects=" << edits.size() << " res=" << ext.width << "x" << ext.height
+                              << " avg_frame_ms=" << ms << " bricks=" << renderer.getVolume().getStats().used << std::endl;
+                    break;
+                }
+            }
         }
 
         context.getDevice().waitIdle();
         std::cout << "Editor Shutdown Successfully!" << std::endl;
-
     } catch (const std::exception& e) {
         std::cerr << "Fatal Error: " << e.what() << std::endl;
         return EXIT_FAILURE;
     }
-
     return EXIT_SUCCESS;
 }
