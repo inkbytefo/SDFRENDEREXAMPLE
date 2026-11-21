@@ -205,9 +205,10 @@ bool VulkanContext::isDeviceSuitable(vk::PhysicalDevice dev) {
     auto chain = dev.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan13Features>();
     if (!chain.get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering) return false;
 
-    // Brick atlas needs linear filtering of R16F 3D textures.
-    auto fmt = dev.getFormatProperties(vk::Format::eR16Sfloat);
-    return static_cast<bool>(fmt.optimalTilingFeatures & vk::FormatFeatureFlagBits::eSampledImageFilterLinear);
+    // Brick atlas: written as an R16F storage image, sampled with linear filtering.
+    auto fmt = dev.getFormatProperties(vk::Format::eR16Sfloat).optimalTilingFeatures;
+    return (fmt & vk::FormatFeatureFlagBits::eSampledImageFilterLinear) &&
+           (fmt & vk::FormatFeatureFlagBits::eStorageImage);
 }
 
 std::vector<const char*> VulkanContext::getRequiredExtensions() {
